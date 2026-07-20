@@ -19,7 +19,7 @@ from section_content_taxonomy import (
 )
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-ROOT = SCRIPT_DIR.parents[4]
+ROOT = SCRIPT_DIR.parent.parent
 DEFAULT_FIELD_MODEL_PATH = (
     ROOT / "wa577_gallery" / "section_classifier" / "models" / "section_fields.bin"
 )

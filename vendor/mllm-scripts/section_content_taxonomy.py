@@ -18,7 +18,7 @@ except ImportError:  # pragma: no cover
     yaml = None  # type: ignore[assignment]
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-ROOT = SCRIPT_DIR.parents[4]
+ROOT = SCRIPT_DIR.parent.parent  # DocExtract repo root (standalone deploy)
 DEFAULT_CONFIGS_ROOT = (
     ROOT.parent / "techno-configs" / "techno_configs" / "envs" / "qa" / "document_fields" / "extractions" / "llm_configs"
 )

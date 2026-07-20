@@ -41,7 +41,7 @@ from section_field_classifier import (
 )
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-ROOT = SCRIPT_DIR.parents[4]
+ROOT = SCRIPT_DIR.parent.parent
 
 
 class DropReason(str, Enum):

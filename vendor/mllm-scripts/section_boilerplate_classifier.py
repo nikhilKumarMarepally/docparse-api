@@ -11,7 +11,7 @@ from typing import Any
 from section_content_heuristics import normalize_ocr_text, preprocess_for_fasttext
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-ROOT = SCRIPT_DIR.parents[4]
+ROOT = SCRIPT_DIR.parent.parent
 DEFAULT_MODEL_PATH = (
     ROOT / "wa577_gallery" / "section_classifier" / "models" / "section_has_data.bin"
 )
