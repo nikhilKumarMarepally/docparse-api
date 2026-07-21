@@ -1,27 +1,9 @@
-# DocExtract API
+# DocExtract (Render API deploy)
 
-Backend for [extracteverythiing.vercel.app](https://extracteverythiing.vercel.app) — document OCR, section layout, hybrid table detection, and Gemini extraction.
+This folder is the **minimal Docker deploy** for [docparse-api on Render](https://docparse-api.onrender.com).
 
-## Deploy (Render)
+**Full app (frontend + local dev + credits/auth source of truth):**
 
-- **Service:** `docparse-api` on Render
-- **Runtime:** Docker (`Dockerfile` at repo root)
-- **Required env vars (Render dashboard):**
-  - `GEMINI_API_KEY` — personal Google AI Studio key
-  - `GOOGLE_CLOUD_API_KEY` — personal Vision API key for OCR
-  - `DOC_EXTRACT_CRED_MODE=personal_only` (set in Dockerfile + render.yaml)
-  - `CORS_ORIGINS` — Vercel frontend URLs
+`~/Desktop/classification/nikhil_desktop/doc-extract-web`
 
-Health check: `GET /api/health` → `"cred_mode": "personal_deploy"`, `"gemini_auth": "api_key"`
-
-## Local dev
-
-```bash
-cd backend
-python -m venv .venv && source .venv/bin/activate
-pip install -e .
-export GEMINI_API_KEY=...
-export GOOGLE_CLOUD_API_KEY=...
-export DOC_EXTRACT_CRED_MODE=personal_only
-uvicorn app.main:app --reload --port 8000
-```
+Sync backend changes from `doc-extract-web/backend` and `vendor/mllm-scripts` when cutting a Render release to `nikhilKumarMarepally/docparse-api` on GitHub.

@@ -64,23 +64,22 @@ def draw_filter_overlay(
     except OSError:
         font = ImageFont.load_default()
 
+    img_w, img_h = img.size
     for section in sections:
         bounds = section.get("bounds") or {}
-        x0 = int(bounds.get("min_x", 0))
-        y0 = int(bounds.get("min_y", 0))
-        x1 = int(bounds.get("max_x", 0))
-        y1 = int(bounds.get("max_y", 0))
+        x0 = max(0, min(int(bounds.get("min_x", 0)), img_w - 1))
+        y0 = max(0, min(int(bounds.get("min_y", 0)), img_h - 1))
+        x1 = max(x0, min(int(bounds.get("max_x", 0)), img_w))
+        y1 = max(y0, min(int(bounds.get("max_y", 0)), img_h))
         prep = section.get("preprocess") or {}
         kept = bool(prep.get("kept", True))
         color = (34, 160, 80) if kept else (220, 50, 50)
         draw.rectangle([(x0, y0), (x1, y1)], outline=color, width=4)
-        tag = "KEEP" if kept else "FILTERED"
-        reason = prep.get("reason") or ""
-        label = f"S{section.get('index', 0)} {tag}"
-        if reason:
-            label += f" ({reason})"
-        draw.rectangle([(x0, max(0, y0 - 18)), (x0 + 180, y0)], fill=(*color, 220))
-        draw.text((x0 + 4, max(0, y0 - 16)), label, fill=(255, 255, 255), font=font)
+        label = f"S{section.get('index', 0)}"
+        label_top = max(0, y0 - 18)
+        label_bottom = max(label_top + 1, y0)
+        draw.rectangle([(x0, label_top), (x0 + 48, label_bottom)], fill=(*color, 220))
+        draw.text((x0 + 4, label_top + 2), label, fill=(255, 255, 255), font=font)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     img.convert("RGB").save(out_path, format="PNG")
@@ -163,7 +162,7 @@ def process_page(
         field_styles: dict[str, bool | None] = {}
 
         fields: dict[str, Any] | None = None
-        if kept and not skip_llm:
+        if not skip_llm:
             enhanced = enhance_section_crop(crop_img)
             fields = extractor.extract_section(
                 enhanced,
