@@ -179,6 +179,27 @@ def combine_phrase(parts: list[str]) -> str:
     return " ".join(result)
 
 
+def split_row_by_column_gutter(
+    row: list[Word],
+    *,
+    min_gutter_px: float = 72.0,
+) -> list[list[Word]]:
+    if len(row) < 2:
+        return [row]
+    gaps: list[tuple[float, int]] = []
+    for i in range(len(row) - 1):
+        gap = row[i + 1].box.min_x - row[i].box.max_x
+        gaps.append((gap, i))
+    best_gap, split_at = max(gaps, key=lambda t: t[0])
+    if best_gap < min_gutter_px:
+        return [row]
+    left, right = row[: split_at + 1], row[split_at + 1 :]
+    parts: list[list[Word]] = []
+    parts.extend(split_row_by_column_gutter(left, min_gutter_px=min_gutter_px))
+    parts.extend(split_row_by_column_gutter(right, min_gutter_px=min_gutter_px))
+    return parts
+
+
 def group_into_rows(words: list[Word]) -> list[list[Word]]:
     """Cluster OCR tokens into horizontal rows by vertical position."""
     if not words:
@@ -209,18 +230,402 @@ def words_to_lines(
     *,
     page_width: int | None = None,
     full_width: bool = True,
+    split_columns: bool = False,
 ) -> list[Line]:
     lines: list[Line] = []
     for row in group_into_rows(words):
-        row.sort(key=lambda w: w.box.min_x)
-        text = combine_phrase([w.text for w in row])
-        box = row[0].box
-        for w in row[1:]:
-            box = box.union(w.box)
-        if full_width and page_width:
-            box = Box(0.0, box.min_y, float(page_width), box.max_y)
-        lines.append(Line(index=len(lines), text=text, box=box, words=row))
+        chunks = split_row_by_column_gutter(row) if split_columns else [row]
+        for chunk in chunks:
+            chunk.sort(key=lambda w: w.box.min_x)
+            text = combine_phrase([w.text for w in chunk])
+            box = chunk[0].box
+            for w in chunk[1:]:
+                box = box.union(w.box)
+            if full_width and page_width and not split_columns:
+                box = Box(0.0, box.min_y, float(page_width), box.max_y)
+            lines.append(Line(index=len(lines), text=text, box=box, words=chunk))
     return lines
+
+
+@dataclass
+class AlignedTextColumn:
+    """Vertical strip where line left edges (x) line up on the left or right page margin."""
+
+    side: str
+    anchor_min_x: float
+    bounds: Box
+    line_indices: list[int]
+    split_x: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "side": self.side,
+            "anchor_min_x": round(self.anchor_min_x, 1),
+            "split_x": round(self.split_x, 1),
+            "bounds": self.bounds.to_dict(),
+            "line_count": len(self.line_indices),
+            "line_indices": self.line_indices,
+        }
+
+
+# Generic aligned-column rule: infer the page gutter from wide-row whitespace, cluster
+# outer-margin word left-edges into an anchor x, keep only lines whose column-side OCR
+# mass dominates, reject strips that would bisect opposing text, and scope column y to the
+# aligned cluster (not the full page).
+
+
+def estimate_page_gutter_x(lines: list[Line], page_width: float) -> float:
+    """Infer the main vertical gutter from wide OCR rows (largest inter-word gaps near page center)."""
+    import statistics
+
+    gap_candidates: list[float] = []
+    for ln in lines:
+        words = sorted(ln.words, key=lambda w: w.box.min_x)
+        if len(words) < 2 or ln.content_box.width < page_width * 0.28:
+            continue
+        for left_w, right_w in zip(words, words[1:]):
+            gap = right_w.box.min_x - left_w.box.max_x
+            if gap < 44.0:
+                continue
+            midpoint = (left_w.box.max_x + right_w.box.min_x) * 0.5
+            if page_width * 0.22 <= midpoint <= page_width * 0.82:
+                gap_candidates.append(midpoint)
+    if not gap_candidates:
+        return page_width * 0.55
+    return float(statistics.median(gap_candidates))
+
+
+def _words_on_side(
+    line: Line,
+    *,
+    side: str,
+    gutter_x: float,
+    anchor_min_x: float,
+    anchor_slack_px: float = 28.0,
+) -> list[Word]:
+    if side == "right":
+        edge_floor = anchor_min_x - anchor_slack_px
+        return [
+            w
+            for w in line.words
+            if w.box.centroid_x >= gutter_x - 4.0 and w.box.min_x >= edge_floor
+        ]
+    edge_ceil = anchor_min_x + anchor_slack_px
+    return [
+        w
+        for w in line.words
+        if w.box.centroid_x <= gutter_x + 4.0 and w.box.max_x <= edge_ceil
+    ]
+
+
+def _line_side_mass(line: Line, split_x: float) -> tuple[float, float]:
+    left = 0.0
+    right = 0.0
+    for w in line.words:
+        wmass = max(1.0, w.box.width)
+        if w.box.centroid_x < split_x:
+            left += wmass
+        else:
+            right += wmass
+    return left, right
+
+
+def vertical_column_bbox_invalid(
+    lines: list[Line],
+    *,
+    col_bounds: Box,
+    split_x: float,
+    gutter_slack_px: float = 4.0,
+) -> bool:
+    """True when the vertical strip bisects OCR (straddle or body text inside the strip)."""
+    for ln in lines:
+        cb = ln.content_box
+        if cb.max_y < col_bounds.min_y - 2.0 or cb.min_y > col_bounds.max_y + 2.0:
+            continue
+        if cb.max_x <= col_bounds.min_x + 2.0 or cb.min_x >= col_bounds.max_x - 2.0:
+            continue
+        for w in ln.words:
+            if (
+                w.box.min_x < split_x - gutter_slack_px
+                and w.box.max_x > split_x + gutter_slack_px
+            ):
+                return True
+        for w in ln.words:
+            wb = w.box
+            if wb.max_y < col_bounds.min_y or wb.min_y > col_bounds.max_y:
+                continue
+            if wb.max_x <= col_bounds.min_x or wb.min_x >= col_bounds.max_x:
+                continue
+            if wb.centroid_x < split_x - gutter_slack_px and wb.max_x > col_bounds.min_x + 2.0:
+                return True
+    return False
+
+
+def _line_assignable_to_column(
+    line: Line,
+    *,
+    side: str,
+    split_x: float,
+    gutter_x: float,
+    anchor_min_x: float,
+    gutter_slack_px: float = 4.0,
+) -> bool:
+    """True when aligned column-side words exist and no token straddles the gutter."""
+    for w in line.words:
+        if (
+            w.box.min_x < split_x - gutter_slack_px
+            and w.box.max_x > split_x + gutter_slack_px
+        ):
+            return False
+    side_words = _words_on_side(
+        line, side=side, gutter_x=gutter_x, anchor_min_x=anchor_min_x
+    )
+    if not side_words:
+        return False
+    for w in line.words:
+        if w in side_words:
+            continue
+        if side == "right" and w.box.max_x > split_x - gutter_slack_px:
+            return False
+        if side == "left" and w.box.min_x < split_x + gutter_slack_px:
+            return False
+    return True
+
+
+def aligned_column_valid_for_vertical(
+    lines: list[Line],
+    column: AlignedTextColumn,
+) -> bool:
+    """Validity pass: no OCR row in the strip y-band is bisected by the column rectangle."""
+    return not vertical_column_bbox_invalid(
+        lines,
+        col_bounds=column.bounds,
+        split_x=column.split_x,
+    )
+
+
+def _detect_aligned_text_column_one_side(
+    lines: list[Line],
+    *,
+    page_width: float,
+    side: str,
+    gutter_x: float,
+    min_lines: int,
+    anchor_tolerance_px: float,
+    bin_width_px: float,
+) -> AlignedTextColumn | None:
+    from collections import Counter
+
+    if side == "right":
+        stripe_lo = max(gutter_x + 8.0, page_width * 0.62)
+        stripe_hi = page_width
+    else:
+        stripe_lo = 0.0
+        stripe_hi = min(gutter_x - 8.0, page_width * 0.38)
+
+    word_edges: list[float] = []
+    for ln in lines:
+        for w in ln.words:
+            cx = w.box.centroid_x
+            mx = w.box.min_x
+            if side == "right":
+                if mx >= stripe_lo and cx >= gutter_x - 4.0:
+                    word_edges.append(mx)
+            elif cx <= stripe_hi and w.box.max_x <= gutter_x + 4.0:
+                word_edges.append(mx)
+
+    if len(word_edges) < max(8, min_lines * 2):
+        return None
+
+    hist = Counter(int(round(x / bin_width_px)) * int(bin_width_px) for x in word_edges)
+    anchor = float(hist.most_common(1)[0][0])
+
+    split_guess = max(gutter_x + 4.0, anchor - 18.0) if side == "right" else min(gutter_x - 4.0, anchor + 24.0)
+
+    kept: list[Line] = []
+    for ln in lines:
+        side_words = _words_on_side(
+            ln, side=side, gutter_x=gutter_x, anchor_min_x=anchor
+        )
+        if not side_words:
+            continue
+        edge = min(w.box.min_x for w in side_words)
+        if abs(edge - anchor) > anchor_tolerance_px:
+            continue
+        if not _line_assignable_to_column(
+            ln,
+            side=side,
+            split_x=split_guess,
+            gutter_x=gutter_x,
+            anchor_min_x=anchor,
+        ):
+            continue
+        kept.append(ln)
+
+    if len(kept) < min_lines:
+        return None
+
+    kept.sort(key=lambda ln: ln.content_box.min_y)
+    y0 = min(ln.content_box.min_y for ln in kept)
+    y1 = max(ln.content_box.max_y for ln in kept)
+
+    if side == "right":
+        split_x = max(gutter_x + 4.0, anchor - 18.0)
+        column_left = split_x
+    else:
+        split_x = min(gutter_x - 4.0, anchor + max(24.0, bin_width_px))
+        column_left = min(w.box.min_x for ln in kept for w in ln.words)
+
+    bounds: Box | None = None
+    for ln in kept:
+        side_words = _words_on_side(
+            ln, side=side, gutter_x=gutter_x, anchor_min_x=anchor
+        )
+        for w in side_words:
+            bounds = w.box if bounds is None else bounds.union(w.box)
+    if bounds is None:
+        return None
+
+    if side == "right":
+        bounds = Box(column_left, y0, bounds.max_x, y1)
+    else:
+        bounds = Box(bounds.min_x, y0, split_x, y1)
+
+    if vertical_column_bbox_invalid(lines, col_bounds=bounds, split_x=split_x):
+        return None
+
+    return AlignedTextColumn(
+        side=side,
+        anchor_min_x=anchor,
+        bounds=bounds,
+        line_indices=[ln.index for ln in kept],
+        split_x=split_x,
+    )
+
+
+def detect_aligned_text_column(
+    lines: list[Line],
+    *,
+    page_width: float,
+    side: str | None = None,
+    min_lines: int = 6,
+    gutter_x: float | None = None,
+    anchor_tolerance_px: float = 80.0,
+    bin_width_px: float = 20.0,
+    y_min: float | None = None,
+    y_max: float | None = None,
+    min_anchor_frac: float = 0.0,
+) -> AlignedTextColumn | None:
+    """Detect a vertically aligned text column on the left or right.
+
+    Generic rule: cluster word left-edges past the page gutter; keep lines whose
+    column-side words share an anchor x; reject candidates whose bounding box
+    intersects bisected OCR rows (significant mass on both sides of the split).
+    Column y-extent is only the aligned cluster, not the full page.
+    """
+    scoped = lines
+    if y_min is not None or y_max is not None:
+        lo = y_min if y_min is not None else float("-inf")
+        hi = y_max if y_max is not None else float("inf")
+        scoped = [
+            ln
+            for ln in lines
+            if ln.content_box.max_y >= lo and ln.content_box.min_y <= hi
+        ]
+    if not scoped:
+        return None
+
+    gx = gutter_x if gutter_x is not None else estimate_page_gutter_x(scoped, page_width)
+    band_min_lines = max(3, min(min_lines, len(scoped) // 5))
+
+    candidates: list[AlignedTextColumn] = []
+    sides = (side,) if side in ("left", "right") else ("left", "right")
+    for s in sides:
+        col = _detect_aligned_text_column_one_side(
+            scoped,
+            page_width=page_width,
+            side=s,
+            gutter_x=gx,
+            min_lines=band_min_lines,
+            anchor_tolerance_px=anchor_tolerance_px,
+            bin_width_px=bin_width_px,
+        )
+        if col is None:
+            continue
+        if s == "right" and min_anchor_frac > 0 and col.anchor_min_x < page_width * min_anchor_frac:
+            continue
+        candidates.append(col)
+
+    if not candidates:
+        return None
+
+    def _score(col: AlignedTextColumn) -> tuple[float, float, float]:
+        outer = col.anchor_min_x if col.side == "right" else page_width - col.anchor_min_x
+        height = col.bounds.max_y - col.bounds.min_y
+        return (float(len(col.line_indices)), outer, height)
+
+    return max(candidates, key=_score)
+
+
+def line_from_words(words: list[Word], *, index: int) -> Line | None:
+    if not words:
+        return None
+    box = words[0].box
+    for w in words[1:]:
+        box = box.union(w.box)
+    text = " ".join(w.text for w in words if w.text.strip())
+    if not text.strip():
+        return None
+    return Line(index=index, text=text, box=box, words=words)
+
+
+def partition_lines_at_column(
+    lines: list[Line],
+    column: AlignedTextColumn,
+    *,
+    page_width: float,
+    split_x: float | None = None,
+    gutter_x: float | None = None,
+) -> tuple[list[Line], list[Line]]:
+    """Word-split lines at the detected column gutter; emit separate left/right line fragments."""
+    gx = gutter_x if gutter_x is not None else estimate_page_gutter_x(lines, page_width)
+    anchor = column.anchor_min_x
+    column_split = split_x if split_x is not None else column.split_x
+    left_lines: list[Line] = []
+    right_lines: list[Line] = []
+    for ln in lines:
+        side = column.side
+        if side == "right":
+            col_words = _words_on_side(
+                ln, side="right", gutter_x=gx, anchor_min_x=anchor
+            )
+        else:
+            col_words = _words_on_side(
+                ln, side="left", gutter_x=gx, anchor_min_x=anchor
+            )
+        col_ids = {id(w) for w in col_words}
+        left_words = [
+            w
+            for w in ln.words
+            if id(w) not in col_ids and w.box.centroid_x < column_split - 4.0
+        ]
+        right_words = [
+            w
+            for w in ln.words
+            if id(w) not in col_ids and w.box.centroid_x >= column_split + 4.0
+        ]
+        if side == "right":
+            right_words = col_words + right_words
+        else:
+            left_words = col_words + left_words
+
+        left_ln = line_from_words(left_words, index=len(left_lines))
+        if left_ln is not None:
+            left_lines.append(left_ln)
+        right_ln = line_from_words(right_words, index=len(right_lines))
+        if right_ln is not None:
+            right_lines.append(right_ln)
+    return left_lines, right_lines
 
 
 def load_font(size: int = 12) -> ImageFont.ImageFont:
