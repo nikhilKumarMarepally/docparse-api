@@ -3,14 +3,29 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from app.jobs import create_job, get_job, job_file_path
 from app.paths import JOB_ROOT, TOOL_ROOT, configure_web_env, is_cloud_deploy
-from app.auth import auth_required, current_user, google_client_id, login_with_google
-from app.redshift_users import redshift_status
+from app.auth import (
+    auth_required,
+    current_user,
+    google_client_id,
+    login_with_email,
+    login_with_google,
+    me_from_token_payload,
+    register_with_email,
+    verify_session_token,
+)
+from app.users_db import (
+    CREDITS_PER_DOCUMENT,
+    InsufficientCreditsError,
+    get_user_by_id,
+    spend_credits_for_job,
+)
+from app.users_db import users_db_status
 
 _CRED_SOURCE = configure_web_env()
 
@@ -106,16 +121,48 @@ def health() -> dict:
         "gemini_project": gemini_project,
         "auth_required": auth_required(),
         "google_oauth": bool(google_client_id()),
-        "redshift": redshift_status(),
+        "users_db": users_db_status(),
     }
 
 
 @app.get("/api/auth/config")
 def auth_config() -> dict:
+    from app.users_db import INITIAL_CREDITS
+
     return {
         "auth_required": auth_required(),
         "google_client_id": google_client_id(),
+        "initial_credits": INITIAL_CREDITS,
+        "credits_per_document": CREDITS_PER_DOCUMENT,
     }
+
+
+@app.post("/api/auth/register")
+def auth_register(body: dict) -> dict:
+    email = body.get("email")
+    password = body.get("password")
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="Email and password are required")
+    return register_with_email(str(email), str(password))
+
+
+@app.post("/api/auth/login")
+def auth_login(body: dict) -> dict:
+    email = body.get("email")
+    password = body.get("password")
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="Email and password are required")
+    return login_with_email(str(email), str(password))
+
+
+@app.get("/api/auth/me")
+def auth_me(authorization: str | None = Header(default=None)) -> dict:
+    if not auth_required():
+        return {"auth_required": False}
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Sign in required")
+    payload = verify_session_token(authorization.removeprefix("Bearer ").strip())
+    return me_from_token_payload(payload)
 
 
 @app.post("/api/auth/google")
@@ -150,9 +197,23 @@ async def upload_job(
     file: UploadFile = File(...),
     skip_llm: bool = False,
     user: dict | None = Depends(current_user),
-) -> dict[str, str]:
+) -> dict[str, str | int]:
     if not file.filename:
         raise HTTPException(status_code=400, detail="Missing filename")
+
+    credits_remaining: int | None = None
+    if auth_required() and user:
+        uid = str(user["sub"])
+        account = get_user_by_id(uid)
+        balance = account["credits"] if account else 0
+        if balance < CREDITS_PER_DOCUMENT:
+            raise HTTPException(
+                status_code=402,
+                detail=(
+                    "You ran out of credits. Each document costs 2 credits; "
+                    "new accounts start with 2 credits (one free document)."
+                ),
+            )
 
     suffix = Path(file.filename).suffix.lower()
     if suffix not in ALLOWED_SUFFIXES:
@@ -171,7 +232,22 @@ async def upload_job(
         if tmp.exists():
             tmp.unlink()
 
-    return {"job_id": job.job_id}
+    if auth_required() and user:
+        try:
+            credits_remaining = spend_credits_for_job(str(user["sub"]), job.job_id)
+        except InsufficientCreditsError:
+            raise HTTPException(
+                status_code=402,
+                detail=(
+                    "You ran out of credits. Each document costs 2 credits; "
+                    "new accounts start with 2 credits (one free document)."
+                ),
+            )
+
+    payload: dict[str, str | int] = {"job_id": job.job_id}
+    if credits_remaining is not None:
+        payload["credits_remaining"] = credits_remaining
+    return payload
 
 
 @app.get("/api/jobs/{job_id}")

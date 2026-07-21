@@ -10,7 +10,6 @@ from PIL import Image, ImageDraw, ImageFont
 from app.extract.gemini import GeminiExtractor, get_extractor
 from app.ocr import run_ocr
 from app.paths import ensure_script_path
-from app.section_merge import merge_table_fragments
 from app.text_weight import (
     annotate_word_styles,
     bold_text_in_section,
@@ -21,10 +20,15 @@ from app.text_weight import (
 
 ensure_script_path()
 
-from ocr_line_to_sections import lines_to_sections  # noqa: E402
+from ocr_line_to_sections import (  # noqa: E402
+    _make_section,
+    lines_to_sections_hv_combined,
+)
 from ocr_word_to_line_boxes import load_words, words_to_lines  # noqa: E402
-from app.section_crop import crop_section_image, enhance_section_crop
+from section_content_gemini_gallery import crop_section_image, enhance_section_crop  # noqa: E402
+from section_layout_breaks import lines_to_sections_human  # noqa: E402
 from section_preprocess import annotate_preprocess  # noqa: E402
+from section_table_layout import classify_section_layout  # noqa: E402
 
 
 def _section_label(text: str, index: int) -> str:
@@ -74,12 +78,8 @@ def draw_filter_overlay(
         kept = bool(prep.get("kept", True))
         color = (34, 160, 80) if kept else (220, 50, 50)
         draw.rectangle([(x0, y0), (x1, y1)], outline=color, width=4)
-        tag = "KEEP" if kept else "FILTERED"
-        reason = prep.get("reason") or ""
-        label = f"S{section.get('index', 0)} {tag}"
-        if reason:
-            label += f" ({reason})"
-        draw.rectangle([(x0, max(0, y0 - 18)), (x0 + 180, y0)], fill=(*color, 220))
+        label = f"S{section.get('index', 0)}"
+        draw.rectangle([(x0, max(0, y0 - 18)), (x0 + 48, y0)], fill=(*color, 220))
         draw.text((x0 + 4, max(0, y0 - 16)), label, fill=(255, 255, 255), font=font)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -107,15 +107,41 @@ def process_page(
     words = load_words(vision)
     with Image.open(page_png) as img:
         page_width = img.width
-    lines = words_to_lines(words, page_width=page_width, full_width=True)
-    sections_obj, gap_stats = lines_to_sections(lines)
-    raw_sections = [s.to_dict() for s in sections_obj]
-    raw_sections = merge_table_fragments(
-        raw_sections,
-        lines,
-        gap_threshold=gap_stats.threshold,
-        page_width=float(page_width),
+        page_rgb = img.convert("RGB")
+
+    use_human_layout = bool((vision.get("image_blocks") or {}).get("with_polygons"))
+    fw_lines = words_to_lines(words, page_width=page_width, full_width=True)
+    split_lines = words_to_lines(
+        words,
+        page_width=page_width,
+        full_width=False,
+        split_columns=True,
     )
+
+    if use_human_layout:
+        human_chunks, _section_meta = lines_to_sections_human(
+            split_lines,
+            vision=vision,
+            page_width=float(page_width),
+            image_rgb=page_rgb,
+            min_gap_px=8.0,
+        )
+        sections_obj = [
+            _make_section(i, line_group, None, 6.0) for i, (line_group, _, _) in enumerate(human_chunks)
+        ]
+        lines = split_lines
+    else:
+        sections_obj, gap_stats, _column_meta = lines_to_sections_hv_combined(
+            split_lines,
+            page_width=float(page_width),
+            full_width_lines=fw_lines,
+            min_gap_px=18.0,
+        )
+        lines = fw_lines
+
+    raw_sections = [
+        s.to_dict(layout=classify_section_layout(s.lines).to_dict()) for s in sections_obj
+    ]
     sections_path = page_dir / "sections.json"
     sections_path.write_text(json.dumps({"sections": raw_sections}, indent=2))
 
@@ -137,9 +163,6 @@ def process_page(
     page_field_styles: dict[str, bool | None] = {}
     warnings: list[str] = []
     section_rows: list[dict[str, Any]] = []
-
-    with Image.open(page_png) as page_img:
-        page_rgb = page_img.convert("RGB")
 
     step("extract")
     for section in annotated:
@@ -170,7 +193,10 @@ def process_page(
                 ocr_text,
                 section_words=section_words,
                 bounds=bounds,
-                table_band=bool(section.get("table_band")),
+                table_band=bool(
+                    section.get("table_band")
+                    or section.get("layout_kind") in ("table", "section_table")
+                ),
             )
             if not fields:
                 warnings.append(f"page {page_index} section {idx}: low_signal (0 fields extracted)")

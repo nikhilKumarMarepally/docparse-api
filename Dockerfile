@@ -17,6 +17,8 @@ RUN pip install --no-cache-dir -e .
 ENV PYTHONPATH=/app/backend
 ENV DOC_EXTRACT_JOB_ROOT=/tmp/doc-extract-web
 ENV DOC_EXTRACT_CRED_MODE=personal_only
+ENV DOC_EXTRACT_DATA_DIR=/var/data
+ENV DOC_EXTRACT_USERS_DB=/var/data/users.sqlite
 
 EXPOSE 8000
 

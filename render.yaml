@@ -6,16 +6,28 @@ services:
     dockerContext: .
     plan: free
     healthCheckPath: /api/health
+    disk:
+      name: docparse-data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: DOC_EXTRACT_JOB_ROOT
         value: /tmp/doc-extract-web
+      - key: DOC_EXTRACT_DATA_DIR
+        value: /var/data
+      - key: DOC_EXTRACT_USERS_DB
+        value: /var/data/users.sqlite
       - key: DOC_EXTRACT_CRED_MODE
         value: personal_only
       - key: CORS_ORIGINS
         value: https://extracteverythiing.vercel.app,https://docparse-web.vercel.app,https://extractall.vercel.app,http://127.0.0.1:5173
       - key: DOC_EXTRACT_AUTH_REQUIRED
-        value: "false"
+        value: "true"
       - key: GEMINI_API_KEY
         sync: false
       - key: GOOGLE_CLOUD_API_KEY
         sync: false
+      - key: GOOGLE_OAUTH_CLIENT_ID
+        sync: false
+      - key: DOC_EXTRACT_JWT_SECRET
+        generateValue: true
