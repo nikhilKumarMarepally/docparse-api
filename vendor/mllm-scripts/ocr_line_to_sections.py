@@ -255,23 +255,136 @@ def section_layout_payload(sections: list[Section]) -> tuple[list[dict[str, Any]
     return section_dicts, section_meta
 
 
-def _make_section(
-    index: int,
-    lines: list[Line],
-    gap_above: float | None,
-    pad: float,
-) -> Section:
+def _bounds_covering_lines(lines: list[Line], *, pad: float) -> Box:
+    """Tight box around every OCR word in ``lines`` (+ pad). Never shrink below text."""
+    if not lines:
+        return Box(0.0, 0.0, 1.0, 1.0)
     box = lines[0].content_box
     for line in lines[1:]:
-        box = box.union(line.content_box)
-    box = Box(
+        if line.words:
+            box = box.union(line.content_box)
+    # Prefer full word boxes when present (content_box already unions words, but
+    # keep an explicit pass so clipped/stale section.box cannot cut glyphs).
+    for line in lines:
+        for word in line.words:
+            box = box.union(word.box)
+    return Box(
         box.min_x - pad,
         box.min_y - pad,
         box.max_x + pad,
         box.max_y + pad,
     )
+
+
+def _word_ids(lines: list[Line]) -> set[int]:
+    return {id(w) for ln in lines for w in ln.words}
+
+
+def _nudge_box_off_foreign_words(
+    box: Box,
+    *,
+    own_ids: set[int],
+    all_words: list[Word],
+    gap: float = 1.0,
+) -> Box:
+    """Keep own glyphs fully inside; pull edges out of foreign glyphs.
+
+    Prefer shedding pad over cutting a neighbor. If own and foreign OCR boxes
+    overlap, own coverage wins (cannot satisfy both).
+    """
+    own_boxes = [w.box for w in all_words if id(w) in own_ids]
+    if not own_boxes:
+        return box
+    ox0 = min(b.min_x for b in own_boxes)
+    oy0 = min(b.min_y for b in own_boxes)
+    ox1 = max(b.max_x for b in own_boxes)
+    oy1 = max(b.max_y for b in own_boxes)
+
+    # Start from requested box but never inside own text.
+    min_x = min(box.min_x, ox0)
+    min_y = min(box.min_y, oy0)
+    max_x = max(box.max_x, ox1)
+    max_y = max(box.max_y, oy1)
+
+    foreign = [w.box for w in all_words if id(w) not in own_ids]
+    for wb in foreign:
+        if (
+            wb.min_x + 0.5 < max_x < wb.max_x - 0.5
+            and min(max_y, wb.max_y) - max(min_y, wb.min_y) > 1.0
+        ):
+            # Only shed pad — do not cut own text.
+            max_x = max(ox1, min(max_x, wb.min_x - gap))
+        if (
+            wb.min_x + 0.5 < min_x < wb.max_x - 0.5
+            and min(max_y, wb.max_y) - max(min_y, wb.min_y) > 1.0
+        ):
+            min_x = min(ox0, max(min_x, wb.max_x + gap))
+        if (
+            wb.min_y + 0.5 < max_y < wb.max_y - 0.5
+            and min(max_x, wb.max_x) - max(min_x, wb.min_x) > 1.0
+        ):
+            max_y = max(oy1, min(max_y, wb.min_y - gap))
+        if (
+            wb.min_y + 0.5 < min_y < wb.max_y - 0.5
+            and min(max_x, wb.max_x) - max(min_x, wb.min_x) > 1.0
+        ):
+            min_y = min(oy0, max(min_y, wb.max_y + gap))
+
+    if max_x <= min_x:
+        max_x = min_x + 1.0
+    if max_y <= min_y:
+        max_y = min_y + 1.0
+    return Box(min_x, min_y, max_x, max_y)
+
+
+def _bounds_covering_lines_safe(
+    lines: list[Line],
+    *,
+    pad: float,
+    all_words: list[Word] | None = None,
+) -> Box:
+    box = _bounds_covering_lines(lines, pad=pad)
+    if not all_words:
+        return box
+    return _nudge_box_off_foreign_words(
+        box, own_ids=_word_ids(lines), all_words=all_words
+    )
+
+
+def _recompute_section_box(
+    section: Section,
+    *,
+    pad: float,
+    all_words: list[Word] | None = None,
+) -> Section:
+    """Force section.box to fully cover assigned text — bounds must never cut glyphs."""
+    return Section(
+        index=section.index,
+        lines=section.lines,
+        text=section.text,
+        box=_bounds_covering_lines_safe(section.lines, pad=pad, all_words=all_words),
+        gap_above=section.gap_above,
+    )
+
+
+def _make_section(
+    index: int,
+    lines: list[Line],
+    gap_above: float | None,
+    pad: float,
+    *,
+    all_words: list[Word] | None = None,
+) -> Section:
+    box = _bounds_covering_lines_safe(lines, pad=pad, all_words=all_words)
     text = "\n".join(line.text for line in lines if line.text.strip())
     return Section(index=index, lines=lines, text=text, box=box, gap_above=gap_above)
+
+
+def _flatten_words(lines: list[Line]) -> list[Word]:
+    out: list[Word] = []
+    for ln in lines:
+        out.extend(ln.words)
+    return out
 
 
 def _cluster_gap_sections(
@@ -391,18 +504,34 @@ def _cluster_vertical_column_sections(
 
 
 def _clip_section_box(
-    section: Section, *, max_x: float | None, min_x: float | None, pad: float
+    section: Section,
+    *,
+    max_x: float | None,
+    min_x: float | None,
+    pad: float,
+    all_words: list[Word] | None = None,
 ) -> Section:
-    b = section.box
-    new_min_x = b.min_x if min_x is None else max(b.min_x, min_x)
-    new_max_x = b.max_x if max_x is None else min(b.max_x, max_x)
+    """Clip X for column gutters, then re-expand so no assigned text is cut."""
+    text_box = _bounds_covering_lines_safe(
+        section.lines, pad=pad, all_words=all_words
+    )
+    new_min_x = text_box.min_x if min_x is None else max(text_box.min_x, min_x)
+    new_max_x = text_box.max_x if max_x is None else min(text_box.max_x, max_x)
+    # Never clip inside the text — if gutter clip would cut glyphs, keep text span.
+    new_min_x = min(new_min_x, text_box.min_x)
+    new_max_x = max(new_max_x, text_box.max_x)
     if new_max_x <= new_min_x:
         new_max_x = new_min_x + 1
+    box = Box(new_min_x, text_box.min_y, new_max_x, text_box.max_y)
+    if all_words:
+        box = _nudge_box_off_foreign_words(
+            box, own_ids=_word_ids(section.lines), all_words=all_words
+        )
     return Section(
         index=section.index,
         lines=section.lines,
         text=section.text,
-        box=Box(new_min_x, b.min_y, new_max_x, b.max_y),
+        box=box,
         gap_above=section.gap_above,
     )
 
@@ -452,17 +581,27 @@ def _clip_sections_to_column_bounds(
     *,
     col_bounds: Box,
     pad: float,
+    all_words: list[Word] | None = None,
 ) -> list[Section]:
+    """Widen to column X for layout, but Y/X must still fully cover section text."""
     rb = col_bounds
     out: list[Section] = []
     for sec in sections:
-        b = sec.box
+        text_box = _bounds_covering_lines_safe(sec.lines, pad=pad, all_words=all_words)
+        # Prefer column X band, but never shrink inside text extents.
+        min_x = min(rb.min_x, text_box.min_x)
+        max_x = max(rb.max_x, text_box.max_x)
+        box = Box(min_x, text_box.min_y, max_x, text_box.max_y)
+        if all_words:
+            box = _nudge_box_off_foreign_words(
+                box, own_ids=_word_ids(sec.lines), all_words=all_words
+            )
         out.append(
             Section(
                 sec.index,
                 sec.lines,
                 sec.text,
-                Box(rb.min_x, b.min_y, rb.max_x, b.max_y),
+                box,
                 sec.gap_above,
             )
         )
@@ -514,8 +653,11 @@ def _clip_sections_to_column(
     *,
     col_bounds: Box,
     pad: float,
+    all_words: list[Word] | None = None,
 ) -> list[Section]:
-    return _clip_sections_to_column_bounds(sections, col_bounds=col_bounds, pad=pad)
+    return _clip_sections_to_column_bounds(
+        sections, col_bounds=col_bounds, pad=pad, all_words=all_words
+    )
 
 
 def _band_column_overlap_frac(
@@ -650,6 +792,7 @@ def _lines_to_sections_hv_full_column(
     multiplier: float,
     min_gap_px: float,
     pad: float,
+    all_words: list[Word] | None = None,
 ) -> tuple[list[Section], list[str], int]:
     """Gap-sectioned body stream alongside one full-height aligned column."""
     split_x = page_col.split_x
@@ -678,7 +821,11 @@ def _lines_to_sections_hv_full_column(
     )
     body_sections = [
         _clip_section_box(
-            s, max_x=body_clip_max_x, min_x=body_clip_min_x, pad=pad
+            s,
+            max_x=body_clip_max_x,
+            min_x=body_clip_min_x,
+            pad=pad,
+            all_words=all_words,
         )
         for s in body_sections
     ]
@@ -695,17 +842,26 @@ def _lines_to_sections_hv_full_column(
     ordered_col = sorted(col_lines, key=lambda ln: ln.content_box.min_y)
     col_role = f"column_{page_col.side}"
     if ordered_col:
-        rb = page_col.bounds
-        ry0 = min(ln.content_box.min_y for ln in ordered_col)
-        ry1 = max(ln.content_box.max_y for ln in ordered_col)
-        ry0 = max(ry0, rb.min_y)
+        # Do NOT clamp to column.bounds.min_y/max_y — that cuts header/footer glyphs
+        # that belong to the column text (see 8b824d40_p1 S1 top cut).
         text = "\n".join(ln.text for ln in ordered_col if ln.text.strip())
+        text_box = _bounds_covering_lines_safe(
+            ordered_col, pad=pad, all_words=all_words
+        )
+        rb = page_col.bounds
+        min_x = min(rb.min_x, text_box.min_x)
+        max_x = max(rb.max_x, text_box.max_x)
+        box = Box(min_x, text_box.min_y, max_x, text_box.max_y)
+        if all_words:
+            box = _nudge_box_off_foreign_words(
+                box, own_ids=_word_ids(ordered_col), all_words=all_words
+            )
         col_sections = [
             Section(
                 index=0,
                 lines=ordered_col,
                 text=text,
-                box=Box(rb.min_x, ry0 - pad, rb.max_x, ry1 + pad),
+                box=box,
                 gap_above=None,
             )
         ]
@@ -747,6 +903,7 @@ def lines_to_sections_hv_combined(
 ) -> tuple[list[Section], GapStats, dict[str, Any]]:
     """Horizontal gap bands first; subdivide only bands that contain a valid aligned column."""
     fw = full_width_lines if full_width_lines is not None else lines
+    page_words = _flatten_words(fw)
     gutter_x = estimate_page_gutter_x(fw, page_width)
 
     h_sections, h_stats = lines_to_sections(
@@ -767,6 +924,9 @@ def lines_to_sections_hv_combined(
         ) and _is_full_height_column(page_col_probe, fw):
             skip_vertical_for_table = False
     if skip_vertical_for_table:
+        h_sections = [
+            _recompute_section_box(s, pad=pad, all_words=page_words) for s in h_sections
+        ]
         return h_sections, h_stats, _layout_meta(
             page_col=None,
             gutter_x=gutter_x,
@@ -796,9 +956,14 @@ def lines_to_sections_hv_combined(
             multiplier=multiplier,
             min_gap_px=min_gap_px,
             pad=pad,
+            all_words=page_words,
         )
         sections = [
-            Section(idx, s.lines, s.text, s.box, s.gap_above)
+            _recompute_section_box(
+                Section(idx, s.lines, s.text, s.box, s.gap_above),
+                pad=pad,
+                all_words=page_words,
+            )
             for idx, s in enumerate(merged_secs)
         ]
         meta = _layout_meta(
@@ -869,6 +1034,9 @@ def lines_to_sections_hv_combined(
         merged.extend(zip(split_secs, roles))
 
     if not split_band_indices:
+        h_sections = [
+            _recompute_section_box(s, pad=pad, all_words=page_words) for s in h_sections
+        ]
         return h_sections, h_stats, _layout_meta(
             page_col=None,
             gutter_x=gutter_x,
@@ -881,7 +1049,11 @@ def lines_to_sections_hv_combined(
     merged.sort(key=lambda t: min(ln.content_box.min_y for ln in t[0].lines))
     section_roles = [role for _, role in merged]
     sections = [
-        Section(idx, sec.lines, sec.text, sec.box, sec.gap_above)
+        _recompute_section_box(
+            Section(idx, sec.lines, sec.text, sec.box, sec.gap_above),
+            pad=pad,
+            all_words=page_words,
+        )
         for idx, (sec, _) in enumerate(merged)
     ]
 
@@ -907,6 +1079,7 @@ def lines_to_sections_vertical_only(
 ) -> tuple[list[Section], GapStats, dict[str, Any]]:
     """Gap-cluster only the detected aligned column (y-scoped to the column cluster)."""
     fw = full_width_lines if full_width_lines is not None else lines
+    page_words = _flatten_words(fw)
     gutter_x = estimate_page_gutter_x(fw, page_width)
     column = detect_aligned_text_column(fw, page_width=page_width, gutter_x=gutter_x)
     if column is None or not aligned_column_valid_for_vertical(fw, column):
@@ -939,9 +1112,15 @@ def lines_to_sections_vertical_only(
         min_gap_px=min_gap_px,
         multiplier=multiplier,
     )
-    col_secs = _clip_sections_to_column(col_secs, col_bounds=column.bounds, pad=pad)
+    col_secs = _clip_sections_to_column(
+        col_secs, col_bounds=column.bounds, pad=pad, all_words=page_words
+    )
     sections = [
-        Section(idx, sec.lines, sec.text, sec.box, sec.gap_above)
+        _recompute_section_box(
+            Section(idx, sec.lines, sec.text, sec.box, sec.gap_above),
+            pad=pad,
+            all_words=page_words,
+        )
         for idx, sec in enumerate(col_secs)
     ]
     body = _filter_column_watermark_lines(
