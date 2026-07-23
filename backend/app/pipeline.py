@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
 
@@ -19,6 +21,8 @@ from app.text_weight import (
     styles_to_dicts,
     value_is_bold,
 )
+
+logger = logging.getLogger(__name__)
 
 ensure_script_path()
 
@@ -195,7 +199,18 @@ def process_page(
     use_gate = section_gate_enabled()
     gate_classifier = get_section_gate() if use_gate else None
 
-    for section in annotated:
+    def _layout_kind(section: dict[str, Any]) -> str | None:
+        kind = section.get("layout_kind")
+        if isinstance(kind, str) and kind:
+            return kind
+        layout = section.get("layout")
+        if isinstance(layout, dict):
+            nested = layout.get("layout_kind")
+            if isinstance(nested, str) and nested:
+                return nested
+        return None
+
+    def _prepare_section(section: dict[str, Any]) -> dict[str, Any]:
         idx = int(section.get("index", 0))
         prep = section.get("preprocess") or {}
         preprocess_kept = bool(prep.get("kept", True))
@@ -213,14 +228,13 @@ def process_page(
                 section_words.extend(lines[int(line_idx)].words)
 
         word_styles = annotate_word_styles(page_rgb, section_words)
-        field_styles: dict[str, bool | None] = {}
 
         gate_result = None
         if gate_classifier is not None:
             gate_result = gate_classifier.classify(
                 ocr_text,
                 crop_img=crop_img,
-                layout_kind=section.get("layout_kind"),
+                layout_kind=_layout_kind(section),
             )
             section["content_gate"] = gate_result.to_dict()
 
@@ -231,32 +245,24 @@ def process_page(
         )
         # Preprocess red / gate SKIP do not block Gemini — only skip_llm does.
         run_extract = not skip_llm
+        # Only pure line-item grids use the table prompt. section_table (2-col
+        # address blocks, totals bands) must stay on schema-free extraction —
+        # otherwise S2/S4 falsely become line_items tables.
+        kind = _layout_kind(section)
+        table_band = bool(section.get("table_band")) or kind == "table"
 
         fields: dict[str, Any] | None = None
         if run_extract:
             enhanced = enhance_section_crop(crop_img)
-            fields = extractor.extract_section(
+            # Fresh extractor per worker — Gemini client is not shared across threads.
+            local_extractor = GeminiExtractor(model=extractor.model)
+            fields = local_extractor.extract_section(
                 enhanced,
                 ocr_text,
                 section_words=section_words,
                 bounds=bounds,
-                table_band=bool(
-                    section.get("table_band")
-                    or section.get("layout_kind") in ("table", "section_table")
-                ),
+                table_band=table_band,
             )
-            if not fields:
-                warnings.append(f"page {page_index} section {idx}: low_signal (0 fields extracted)")
-            else:
-                for key, value in fields.items():
-                    if key in ("line_items", "table_columns"):
-                        continue
-                    if isinstance(value, str):
-                        field_styles[key] = value_is_bold(value, word_styles)
-                _merge_fields(page_fields, fields, warnings, page=page_index, section=idx)
-                for key, bold in field_styles.items():
-                    if bold is not None:
-                        page_field_styles[key] = bold
 
         if not run_extract and gate_result is not None and not extractable:
             filter_reason = "content_gate:skip"
@@ -265,25 +271,84 @@ def process_page(
         else:
             filter_reason = None
 
-        section_rows.append(
-            {
-                "index": idx,
-                "label": label,
-                "bounds": bounds,
-                "kept": preprocess_kept,
-                "preprocess_kept": preprocess_kept,
-                "gate_passes": extractable if gate_result is not None else None,
-                "content_gate": gate_result.to_dict() if gate_result else None,
-                "filter_reason": filter_reason,
-                "ocr_preview": ocr_text[:400],
-                "has_bold": section_has_bold(word_styles),
-                "bold_tokens": bold_text_in_section(word_styles),
-                "word_styles": styles_to_dicts(word_styles),
-                "fields": fields,
-                "field_styles": field_styles or None,
-                "crop_path": str(crop_path.relative_to(page_dir.parent.parent)),
-            }
-        )
+        return {
+            "index": idx,
+            "label": label,
+            "bounds": bounds,
+            "kept": True,  # never hide red preprocess boxes from results
+            "preprocess_kept": preprocess_kept,
+            "layout_kind": kind,
+            "table_band": table_band,
+            "gate_passes": extractable if gate_result is not None else None,
+            "content_gate": gate_result.to_dict() if gate_result else None,
+            "filter_reason": filter_reason,
+            "ocr_preview": ocr_text[:400],
+            "has_bold": section_has_bold(word_styles),
+            "bold_tokens": bold_text_in_section(word_styles),
+            "word_styles": styles_to_dicts(word_styles),
+            "fields": fields,
+            "word_styles_obj": word_styles,
+            "crop_path": str(crop_path.relative_to(page_dir.parent.parent)),
+        }
+
+    # Parallel Gemini calls — sequential section extracts were the main latency.
+    max_workers = min(6, max(1, len(annotated)))
+    prepared: list[dict[str, Any] | None] = [None] * len(annotated)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(_prepare_section, section): i
+            for i, section in enumerate(annotated)
+        }
+        for fut in as_completed(futures):
+            i = futures[fut]
+            try:
+                prepared[i] = fut.result()
+            except Exception:
+                logger.exception("section extract failed index=%s", i)
+                section = annotated[i]
+                idx = int(section.get("index", i))
+                prepared[i] = {
+                    "index": idx,
+                    "label": _section_label(section.get("text") or "", idx),
+                    "bounds": section.get("bounds") or {},
+                    "kept": True,
+                    "preprocess_kept": bool((section.get("preprocess") or {}).get("kept", True)),
+                    "layout_kind": _layout_kind(section),
+                    "table_band": False,
+                    "gate_passes": None,
+                    "content_gate": None,
+                    "filter_reason": "extract_error",
+                    "ocr_preview": (section.get("text") or "")[:400],
+                    "has_bold": False,
+                    "bold_tokens": [],
+                    "word_styles": [],
+                    "fields": None,
+                    "word_styles_obj": [],
+                    "crop_path": str((crops_dir / f"s{idx}.png").relative_to(page_dir.parent.parent)),
+                }
+
+    for row in prepared:
+        assert row is not None
+        fields = row.get("fields")
+        field_styles: dict[str, bool | None] = {}
+        word_styles = row.pop("word_styles_obj", [])
+        if not fields:
+            if fields is not None:
+                warnings.append(
+                    f"page {page_index} section {row['index']}: low_signal (0 fields extracted)"
+                )
+        else:
+            for key, value in fields.items():
+                if key in ("line_items", "table_columns"):
+                    continue
+                if isinstance(value, str):
+                    field_styles[key] = value_is_bold(value, word_styles)
+            _merge_fields(page_fields, fields, warnings, page=page_index, section=int(row["index"]))
+            for key, bold in field_styles.items():
+                if bold is not None:
+                    page_field_styles[key] = bold
+        row["field_styles"] = field_styles or None
+        section_rows.append(row)
 
     step("overlay")
     overlay_path = page_dir / "overlay.png"
