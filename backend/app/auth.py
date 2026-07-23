@@ -14,7 +14,6 @@ from google.oauth2 import id_token
 from app.users_db import (
     CREDITS_PER_DOCUMENT,
     INITIAL_CREDITS,
-    get_user_by_id,
     register_email_user,
     upsert_google_user,
     verify_email_login,
