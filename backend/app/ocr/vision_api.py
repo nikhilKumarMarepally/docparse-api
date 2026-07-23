@@ -4,14 +4,22 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
 import requests
 from google.auth.transport.requests import Request
 from google.oauth2 import service_account
+
+logger = logging.getLogger(__name__)
+
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+_MAX_ATTEMPTS = 6
+_BASE_DELAY_SEC = 1.5
 
 
 def _quota_project() -> str | None:
@@ -79,6 +87,16 @@ def _vision_url() -> str:
     return "https://vision.googleapis.com/v1/images:annotate"
 
 
+def _retry_after_seconds(resp: requests.Response, attempt: int) -> float:
+    header = resp.headers.get("Retry-After")
+    if header:
+        try:
+            return max(1.0, float(header))
+        except ValueError:
+            pass
+    return _BASE_DELAY_SEC * (2 ** (attempt - 1))
+
+
 def _call_vision(image_path: Path) -> dict[str, Any]:
     content = base64.b64encode(image_path.read_bytes()).decode("ascii")
     payload = {
@@ -89,19 +107,60 @@ def _call_vision(image_path: Path) -> dict[str, Any]:
             }
         ]
     }
-    resp = requests.post(_vision_url(), headers=_auth_headers(), json=payload, timeout=120)
-    if resp.status_code == 403:
-        raise RuntimeError(
-            "Google Vision API returned 403 Forbidden. Enable Cloud Vision API and billing "
-            "on your GCP project, or verify GOOGLE_CLOUD_API_KEY in .env.local"
-        )
-    resp.raise_for_status()
-    responses = resp.json().get("responses") or []
-    if not responses:
-        raise RuntimeError("Google Vision returned no responses")
-    if "error" in responses[0]:
-        raise RuntimeError(f"Google Vision error: {responses[0]['error']}")
-    return responses[0]
+    url = _vision_url()
+    headers = _auth_headers()
+    last_exc: Exception | None = None
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        resp = requests.post(url, headers=headers, json=payload, timeout=120)
+        if resp.status_code == 403:
+            raise RuntimeError(
+                "Google Vision API returned 403 Forbidden. Enable Cloud Vision API and billing "
+                "on your GCP project, or verify GOOGLE_CLOUD_API_KEY in .env.local"
+            )
+        if resp.status_code in _RETRYABLE_STATUS:
+            delay = _retry_after_seconds(resp, attempt)
+            logger.warning(
+                "Vision API %s (attempt %s/%s); retrying in %.1fs",
+                resp.status_code,
+                attempt,
+                _MAX_ATTEMPTS,
+                delay,
+            )
+            if attempt >= _MAX_ATTEMPTS:
+                raise RuntimeError(
+                    "Google Vision API rate limit (429). Please wait a moment and try again."
+                )
+            time.sleep(delay)
+            continue
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            last_exc = exc
+            raise RuntimeError(
+                f"Google Vision API request failed ({resp.status_code}). Please try again."
+            ) from exc
+        responses = resp.json().get("responses") or []
+        if not responses:
+            raise RuntimeError("Google Vision returned no responses")
+        if "error" in responses[0]:
+            err = responses[0]["error"]
+            code = err.get("code") if isinstance(err, dict) else None
+            if code in _RETRYABLE_STATUS and attempt < _MAX_ATTEMPTS:
+                delay = _BASE_DELAY_SEC * (2 ** (attempt - 1))
+                logger.warning(
+                    "Vision response error %s (attempt %s/%s); retrying in %.1fs",
+                    code,
+                    attempt,
+                    _MAX_ATTEMPTS,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
+            raise RuntimeError(f"Google Vision error: {err}")
+        return responses[0]
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Google Vision request failed after retries")
 
 
 def _word_text(word: dict[str, Any]) -> str:

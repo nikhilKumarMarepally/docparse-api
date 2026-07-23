@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import threading
 import uuid
@@ -15,6 +16,16 @@ from app.pipeline import run_pipeline
 
 ensure_script_path()
 configure_web_env()
+
+_SECRET_IN_URL = re.compile(r"([?&](?:key|access_token|token)=)[^&\s]+", re.I)
+_LONG_KEYISH = re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b")
+
+
+def _sanitize_error(exc: BaseException) -> str:
+    text = str(exc)
+    text = _SECRET_IN_URL.sub(r"\1[REDACTED]", text)
+    text = _LONG_KEYISH.sub("[REDACTED]", text)
+    return text
 
 
 class JobStatus(str, Enum):
@@ -102,7 +113,7 @@ def _run_job(job: Job, upload_path: Path, skip_llm: bool) -> None:
         job.step = "done"
     except Exception as exc:
         job.status = JobStatus.FAILED
-        job.error = str(exc)
+        job.error = _sanitize_error(exc)
         job.step = "failed"
 
 
