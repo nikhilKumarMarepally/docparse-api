@@ -1,8 +1,12 @@
 **/.venv
 **/__pycache__
 **/*.pyc
+**/.pytest_cache
+**/node_modules
 **/.git
 **/.env
 **/.env.local
-**/node_modules
-backend/doc_extract_web.egg-info
+**/.env.*.local
+frontend
+demo_output/**/crops
+demo_output/**/job

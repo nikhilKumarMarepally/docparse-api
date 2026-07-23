@@ -93,7 +93,7 @@ def _call_vision(image_path: Path) -> dict[str, Any]:
     if resp.status_code == 403:
         raise RuntimeError(
             "Google Vision API returned 403 Forbidden. Enable Cloud Vision API and billing "
-            "on your GCP project, or verify GOOGLE_CLOUD_API_KEY in tools/doc-extract-web/.env.local"
+            "on your GCP project, or verify GOOGLE_CLOUD_API_KEY in .env.local"
         )
     resp.raise_for_status()
     responses = resp.json().get("responses") or []

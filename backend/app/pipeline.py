@@ -8,9 +8,10 @@ from typing import Any, Callable
 from PIL import Image, ImageDraw, ImageFont
 
 from app.extract.gemini import GeminiExtractor, get_extractor
+from app.extract.section_gate import get_section_gate, gate_min_confidence, section_gate_enabled
 from app.ocr import run_ocr
 from app.paths import ensure_script_path
-from app.section_merge import merge_table_fragments
+from app.section_crop import crop_section_image, enhance_section_crop
 from app.text_weight import (
     annotate_word_styles,
     bold_text_in_section,
@@ -21,10 +22,14 @@ from app.text_weight import (
 
 ensure_script_path()
 
-from ocr_line_to_sections import lines_to_sections  # noqa: E402
+from ocr_line_to_sections import (  # noqa: E402
+    _make_section,
+    lines_to_sections_hv_combined,
+)
 from ocr_word_to_line_boxes import load_words, words_to_lines  # noqa: E402
-from app.section_crop import crop_section_image, enhance_section_crop
+from section_layout_breaks import lines_to_sections_human  # noqa: E402
 from section_preprocess import annotate_preprocess  # noqa: E402
+from section_table_layout import classify_section_layout  # noqa: E402
 
 
 def _section_label(text: str, index: int) -> str:
@@ -56,13 +61,22 @@ def draw_filter_overlay(
     image_path: Path,
     sections: list[dict[str, Any]],
     out_path: Path,
+    *,
+    overlay_title: str | None = None,
+    overlay_mode: str = "preprocess",
 ) -> None:
     img = Image.open(image_path).convert("RGBA")
     draw = ImageDraw.Draw(img)
     try:
         font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 14)
+        title_font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 16)
     except OSError:
         font = ImageFont.load_default()
+        title_font = font
+
+    if overlay_title:
+        draw.rectangle([(0, 0), (img.width, 28)], fill=(20, 20, 20, 230))
+        draw.text((8, 6), overlay_title, fill=(255, 255, 255), font=title_font)
 
     img_w, img_h = img.size
     for section in sections:
@@ -72,13 +86,27 @@ def draw_filter_overlay(
         x1 = max(x0, min(int(bounds.get("max_x", 0)), img_w))
         y1 = max(y0, min(int(bounds.get("max_y", 0)), img_h))
         prep = section.get("preprocess") or {}
-        kept = bool(prep.get("kept", True))
+        gate = section.get("content_gate") or {}
+        if overlay_mode == "gate" and gate:
+            kept = bool(gate.get("extractable", True))
+            conf = gate.get("confidence")
+            if conf is not None and isinstance(conf, (int, float)):
+                kept = kept and float(conf) >= gate_min_confidence()
+        else:
+            kept = bool(prep.get("kept", True))
         color = (34, 160, 80) if kept else (220, 50, 50)
         draw.rectangle([(x0, y0), (x1, y1)], outline=color, width=4)
-        label = f"S{section.get('index', 0)}"
+        idx = section.get("index", 0)
+        if overlay_mode == "gate" and gate:
+            conf = gate.get("confidence")
+            conf_s = f" {float(conf):.2f}" if conf is not None else ""
+            label = f"S{idx} {'KEEP' if kept else 'SKIP'}{conf_s}"
+        else:
+            label = f"S{idx}"
+        label_w = max(48, 8 * len(label))
         label_top = max(0, y0 - 18)
         label_bottom = max(label_top + 1, y0)
-        draw.rectangle([(x0, label_top), (x0 + 48, label_bottom)], fill=(*color, 220))
+        draw.rectangle([(x0, label_top), (x0 + label_w, label_bottom)], fill=(*color, 220))
         draw.text((x0 + 4, label_top + 2), label, fill=(255, 255, 255), font=font)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -106,15 +134,41 @@ def process_page(
     words = load_words(vision)
     with Image.open(page_png) as img:
         page_width = img.width
-    lines = words_to_lines(words, page_width=page_width, full_width=True)
-    sections_obj, gap_stats = lines_to_sections(lines)
-    raw_sections = [s.to_dict() for s in sections_obj]
-    raw_sections = merge_table_fragments(
-        raw_sections,
-        lines,
-        gap_threshold=gap_stats.threshold,
-        page_width=float(page_width),
+        page_rgb = img.convert("RGB")
+
+    use_human_layout = bool((vision.get("image_blocks") or {}).get("with_polygons"))
+    fw_lines = words_to_lines(words, page_width=page_width, full_width=True)
+    split_lines = words_to_lines(
+        words,
+        page_width=page_width,
+        full_width=False,
+        split_columns=True,
     )
+
+    if use_human_layout:
+        human_chunks, _section_meta = lines_to_sections_human(
+            split_lines,
+            vision=vision,
+            page_width=float(page_width),
+            image_rgb=page_rgb,
+            min_gap_px=8.0,
+        )
+        sections_obj = [
+            _make_section(i, line_group, None, 6.0) for i, (line_group, _, _) in enumerate(human_chunks)
+        ]
+        lines = split_lines
+    else:
+        sections_obj, gap_stats, _column_meta = lines_to_sections_hv_combined(
+            split_lines,
+            page_width=float(page_width),
+            full_width_lines=fw_lines,
+            min_gap_px=18.0,
+        )
+        lines = fw_lines
+
+    raw_sections = [
+        s.to_dict(layout=classify_section_layout(s.lines).to_dict()) for s in sections_obj
+    ]
     sections_path = page_dir / "sections.json"
     sections_path.write_text(json.dumps({"sections": raw_sections}, indent=2))
 
@@ -137,14 +191,14 @@ def process_page(
     warnings: list[str] = []
     section_rows: list[dict[str, Any]] = []
 
-    with Image.open(page_png) as page_img:
-        page_rgb = page_img.convert("RGB")
-
     step("extract")
+    use_gate = section_gate_enabled()
+    gate_classifier = get_section_gate() if use_gate else None
+
     for section in annotated:
         idx = int(section.get("index", 0))
         prep = section.get("preprocess") or {}
-        kept = bool(prep.get("kept", True))
+        preprocess_kept = bool(prep.get("kept", True))
         bounds = section.get("bounds") or {}
         ocr_text = section.get("text") or ""
         label = _section_label(ocr_text, idx)
@@ -161,15 +215,35 @@ def process_page(
         word_styles = annotate_word_styles(page_rgb, section_words)
         field_styles: dict[str, bool | None] = {}
 
+        gate_result = None
+        if gate_classifier is not None:
+            gate_result = gate_classifier.classify(
+                ocr_text,
+                crop_img=crop_img,
+                layout_kind=section.get("layout_kind"),
+            )
+            section["content_gate"] = gate_result.to_dict()
+
+        extractable = (
+            gate_result.passes_threshold(gate_min_confidence())
+            if gate_result is not None
+            else True
+        )
+        # Preprocess red / gate SKIP do not block Gemini — only skip_llm does.
+        run_extract = not skip_llm
+
         fields: dict[str, Any] | None = None
-        if not skip_llm:
+        if run_extract:
             enhanced = enhance_section_crop(crop_img)
             fields = extractor.extract_section(
                 enhanced,
                 ocr_text,
                 section_words=section_words,
                 bounds=bounds,
-                table_band=bool(section.get("table_band")),
+                table_band=bool(
+                    section.get("table_band")
+                    or section.get("layout_kind") in ("table", "section_table")
+                ),
             )
             if not fields:
                 warnings.append(f"page {page_index} section {idx}: low_signal (0 fields extracted)")
@@ -184,13 +258,23 @@ def process_page(
                     if bold is not None:
                         page_field_styles[key] = bold
 
+        if not run_extract and gate_result is not None and not extractable:
+            filter_reason = "content_gate:skip"
+        elif not preprocess_kept:
+            filter_reason = prep.get("reason")
+        else:
+            filter_reason = None
+
         section_rows.append(
             {
                 "index": idx,
                 "label": label,
                 "bounds": bounds,
-                "kept": kept,
-                "filter_reason": None if kept else prep.get("reason"),
+                "kept": preprocess_kept,
+                "preprocess_kept": preprocess_kept,
+                "gate_passes": extractable if gate_result is not None else None,
+                "content_gate": gate_result.to_dict() if gate_result else None,
+                "filter_reason": filter_reason,
                 "ocr_preview": ocr_text[:400],
                 "has_bold": section_has_bold(word_styles),
                 "bold_tokens": bold_text_in_section(word_styles),
@@ -203,7 +287,13 @@ def process_page(
 
     step("overlay")
     overlay_path = page_dir / "overlay.png"
-    draw_filter_overlay(page_png, annotated, overlay_path)
+    draw_filter_overlay(
+        page_png,
+        annotated,
+        overlay_path,
+        overlay_title="Sections — green preprocess kept / red filtered (all sections extracted)",
+        overlay_mode="preprocess",
+    )
 
     return {
         "page_index": page_index,

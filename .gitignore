@@ -1,8 +1,4 @@
-.env
 .env.local
 backend/.venv/
-**/__pycache__/
-*.pyc
-backend/doc_extract_web.egg-info/
-demo_output/**/table_audit/
-demo_output/**/work/
+frontend/node_modules/
+frontend/dist/
