@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
@@ -22,12 +24,14 @@ from app.auth import (
 from app.users_db import (
     CREDITS_PER_DOCUMENT,
     InsufficientCreditsError,
+    ensure_users_table,
     get_user_by_id,
     spend_credits_for_job,
 )
 from app.users_db import users_db_status
 
 _CRED_SOURCE = configure_web_env()
+logger = logging.getLogger(__name__)
 
 
 def _cors_origins() -> list[str]:
@@ -37,7 +41,18 @@ def _cors_origins() -> list[str]:
     return [o.strip() for o in raw.split(",") if o.strip()]
 
 
-app = FastAPI(title="Document Extract Web", version="0.1.0")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    try:
+        ensure_users_table()
+        logger.info("users db ready at %s", users_db_status().get("path"))
+    except Exception:
+        logger.exception("failed to initialize users db on startup")
+        raise
+    yield
+
+
+app = FastAPI(title="Document Extract Web", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

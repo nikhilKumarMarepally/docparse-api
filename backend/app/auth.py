@@ -150,15 +150,29 @@ def current_user(authorization: str | None = Header(default=None)) -> dict[str, 
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Sign in required to extract documents")
     payload = verify_session_token(authorization.removeprefix("Bearer ").strip())
-    fresh = get_user_by_id(str(payload["sub"]))
+    from app.users_db import ensure_account_from_claims
+
+    fresh = ensure_account_from_claims(
+        user_id=str(payload["sub"]),
+        email=payload.get("email"),
+        name=payload.get("name"),
+        picture=payload.get("picture"),
+    )
     if fresh:
         payload["credits"] = fresh["credits"]
     return payload
 
 
 def me_from_token_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    from app.users_db import ensure_account_from_claims
+
     user_id = str(payload["sub"])
-    fresh = get_user_by_id(user_id)
+    fresh = ensure_account_from_claims(
+        user_id=user_id,
+        email=payload.get("email"),
+        name=payload.get("name"),
+        picture=payload.get("picture"),
+    )
     credits = fresh["credits"] if fresh else int(payload.get("credits") or 0)
     return {
         "email": payload.get("email"),

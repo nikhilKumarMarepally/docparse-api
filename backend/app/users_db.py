@@ -107,6 +107,7 @@ def _row_to_public(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def get_user_by_id(user_id: str) -> dict[str, Any] | None:
+    ensure_users_table()
     with _connect() as conn:
         row = conn.execute(
             f"SELECT * FROM {_TABLE} WHERE user_id = ? LIMIT 1",
@@ -116,6 +117,7 @@ def get_user_by_id(user_id: str) -> dict[str, Any] | None:
 
 
 def get_user_by_email(email: str) -> sqlite3.Row | None:
+    ensure_users_table()
     with _connect() as conn:
         return conn.execute(
             f"SELECT * FROM {_TABLE} WHERE email = ? COLLATE NOCASE LIMIT 1",
@@ -247,14 +249,68 @@ def spend_credits_for_job(user_id: str, job_id: str, *, amount: int | None = Non
     return new_balance
 
 
+def ensure_account_from_claims(
+    *,
+    user_id: str,
+    email: str | None,
+    name: str | None = None,
+    picture: str | None = None,
+) -> dict[str, Any] | None:
+    """Create a missing account for a valid JWT (e.g. after disk wipe)."""
+    ensure_users_table()
+    existing = get_user_by_id(user_id)
+    if existing:
+        return existing
+    if not email:
+        return None
+    norm = _normalize_email(email)
+    now = _now()
+    google_sub = user_id.removeprefix("google:") if user_id.startswith("google:") else None
+    with _connect() as conn:
+        by_email = conn.execute(
+            f"SELECT * FROM {_TABLE} WHERE email = ? COLLATE NOCASE LIMIT 1",
+            (norm,),
+        ).fetchone()
+        if by_email:
+            return get_user_by_id(by_email["user_id"])
+        conn.execute(
+            f"""
+            INSERT INTO {_TABLE}
+            (user_id, email, password_hash, google_sub, name, picture_url, credits, created_at, last_login_at)
+            VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, norm, google_sub, name, picture, INITIAL_CREDITS, now, now),
+        )
+        conn.execute(
+            f"""
+            INSERT INTO {_LEDGER} (user_id, job_id, delta, balance_after, reason, created_at)
+            VALUES (?, NULL, ?, ?, ?, ?)
+            """,
+            (user_id, INITIAL_CREDITS, INITIAL_CREDITS, "signup_bonus", now),
+        )
+        conn.commit()
+    return get_user_by_id(user_id)
+
+
 def users_db_status() -> dict[str, Any]:
     path = _db_path()
+    table_ok = False
+    try:
+        ensure_users_table()
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (_TABLE,),
+            ).fetchone()
+            table_ok = bool(row)
+    except Exception as exc:  # noqa: BLE001 — status endpoint must stay up
+        logger.warning("users_db_status failed: %s", exc)
     return {
         "backend": "sqlite",
         "configured": True,
         "path": str(path),
         "table": _TABLE,
-        "exists": path.is_file(),
+        "exists": path.is_file() and table_ok,
         "initial_credits": INITIAL_CREDITS,
         "credits_per_document": CREDITS_PER_DOCUMENT,
     }
