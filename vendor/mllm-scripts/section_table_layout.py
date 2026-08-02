@@ -6,11 +6,157 @@ Clusters word min_x per row; needs ≥3 aligned columns on several rows + unifor
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from statistics import median
 from typing import Any
 
-from ocr_word_to_line_boxes import Line, Word, group_into_rows
+from ocr_word_to_line_boxes import (
+    Line,
+    Word,
+    aligned_column_valid_for_vertical,
+    detect_aligned_text_column,
+    estimate_page_gutter_x,
+    group_into_rows,
+)
+
+_AMOUNT_LIKE = re.compile(r"^\s*\$?\s*[\d,]+\.\d{2}\s*$")
+
+
+def _text_is_amount_like(text: str) -> bool:
+    return bool(_AMOUNT_LIKE.match(text.strip()))
+
+
+@dataclass(frozen=True)
+class VerticalPartitionAnalysis:
+    """Whether a detected vertical gutter splits one row grid or parallel regions."""
+
+    has_column: bool
+    is_unified_grid: bool
+    split_x: float | None
+    row_coupling_ratio: float
+    reasons: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "has_column": self.has_column,
+            "is_unified_grid": self.is_unified_grid,
+            "split_x": round(self.split_x, 1) if self.split_x is not None else None,
+            "row_coupling_ratio": round(self.row_coupling_ratio, 3),
+            "reasons": list(self.reasons),
+        }
+
+    def allows_column_split(self) -> bool:
+        return self.has_column and not self.is_unified_grid
+
+
+def analyze_vertical_partition(lines: list[Line], page_width: float) -> VerticalPartitionAnalysis:
+    """Row-level coupling across a vertical gutter: grid column vs independent sidebar."""
+    if not lines or page_width <= 0:
+        return VerticalPartitionAnalysis(
+            False, True, None, 0.0, ("empty",)
+        )
+    gutter_x = estimate_page_gutter_x(lines, page_width)
+    column = detect_aligned_text_column(
+        lines, page_width=page_width, gutter_x=gutter_x
+    )
+    if column is None or not aligned_column_valid_for_vertical(lines, column):
+        return VerticalPartitionAnalysis(
+            False, True, None, 0.0, ("no_valid_column",)
+        )
+
+    split_x = column.split_x
+    margin = max(14.0, page_width * 0.012)
+    words = [w for ln in lines for w in ln.words]
+    if len(words) < 12:
+        return VerticalPartitionAnalysis(
+            True, True, split_x, 0.0, ("sparse_words",)
+        )
+
+    widths = [w.box.width for w in words]
+    med_w = median(widths) if widths else 12.0
+    _ = max(8.0, med_w * 0.85)  # reserved for future mass thresholds
+
+    rows = group_into_rows(words)
+    coupled = 0
+    left_only = 0
+    right_only = 0
+    right_only_amount = 0
+
+    for row in rows:
+        cells = _split_row_into_cells(row)
+        left_cells = [
+            c
+            for c in cells
+            if max(w.box.centroid_x for w in c) < split_x - margin
+        ]
+        right_cells = [
+            c
+            for c in cells
+            if min(w.box.centroid_x for w in c) > split_x + margin
+        ]
+        has_left = bool(left_cells)
+        has_right = bool(right_cells)
+        if has_left and has_right:
+            coupled += 1
+        elif has_left:
+            left_only += 1
+        elif has_right:
+            right_only += 1
+            row_text = " ".join(w.text for c in right_cells for w in c)
+            if _text_is_amount_like(row_text):
+                right_only_amount += 1
+
+    total_rows = coupled + left_only + right_only
+    if total_rows < 4:
+        return VerticalPartitionAnalysis(
+            True, True, split_x, 0.0, ("few_rows",)
+        )
+
+    coupling = coupled / total_rows
+    amount_right_frac = (
+        right_only_amount / right_only if right_only else 0.0
+    )
+    independent_right_rows = right_only - right_only_amount
+
+    reasons: list[str] = [
+        f"row_coupling:{coupling:.2f}",
+        f"right_only_rows:{right_only}",
+        f"independent_right:{independent_right_rows}",
+        f"amount_right_frac:{amount_right_frac:.2f}",
+    ]
+
+    is_unified: bool
+    if right_only == 0 and total_rows >= 6:
+        is_unified = True
+        reasons.append("inline_table_cells")
+    elif right_only >= 4 and amount_right_frac >= 0.30:
+        is_unified = True
+        reasons.append("amount_column_grid")
+    elif independent_right_rows >= 5 and amount_right_frac < 0.15:
+        is_unified = False
+        reasons.append("prose_sidebar")
+    elif coupling >= 0.38:
+        is_unified = True
+        reasons.append("row_grid_coupling")
+    elif independent_right_rows >= 4 and coupling < 0.34:
+        is_unified = False
+        reasons.append("parallel_right_stream")
+    else:
+        is_unified = coupling >= 0.28 or amount_right_frac >= 0.22
+
+    if is_unified:
+        reasons.append("unified_grid")
+    else:
+        reasons.append("parallel_regions")
+
+    return VerticalPartitionAnalysis(
+        True,
+        is_unified,
+        split_x,
+        coupling,
+        tuple(reasons),
+    )
 
 
 @dataclass(frozen=True)
@@ -262,8 +408,21 @@ def page_layout_from_horizontal_bands(
         return "unknown"
     dominant_i = max(range(len(section_line_counts)), key=lambda i: section_line_counts[i])
     dom = layouts[dominant_i]
+    total = sum(section_line_counts)
     if _layout_is_table_family(dom) and dom.confidence >= confidence_threshold:
-        return "table" if dom.layout_kind == "table" else "mixed"
+        # Dominant table-family band covering most of the page → pure table.
+        # section_table with only a tiny header/footer stub is still one table
+        # (e.g. RISC itemization); "mixed" is for real section + table pages.
+        non_table = sum(
+            n
+            for n, lay in zip(section_line_counts, layouts)
+            if not (
+                _layout_is_table_family(lay) and lay.confidence >= confidence_threshold
+            )
+        )
+        if dom.layout_kind == "table" or (total and non_table / total <= 0.15):
+            return "table"
+        return "mixed"
     kinds = {lay.layout_kind for lay in layouts if lay.confidence >= 0.5}
     if kinds == {"prose"}:
         return "prose"
@@ -277,6 +436,7 @@ def table_layout_skips_vertical(
     layouts: list[SectionLayoutResult],
     *,
     all_lines: list[Line] | None = None,
+    page_width: float | None = None,
     confidence_threshold: float = TABLE_LAYOUT_MIN_CONFIDENCE,
     multi_band_table_line_fraction: float = 0.85,
 ) -> bool:
@@ -293,7 +453,11 @@ def table_layout_skips_vertical(
         and layout.confidence >= confidence_threshold
     )
     if len(section_line_counts) == 1:
-        return table_lines > 0 and table_lines >= total
+        if not (table_lines > 0 and table_lines >= total):
+            return False
+        if all_lines is not None and page_width is not None:
+            return analyze_vertical_partition(all_lines, page_width).is_unified_grid
+        return True
     if table_lines > 0 and table_lines / total >= multi_band_table_line_fraction:
         return True
     # Do not gate the whole page from classify_section_layout(all_lines): mixed invoices
@@ -303,12 +467,23 @@ def table_layout_skips_vertical(
     return False
 
 
-def band_skips_vertical_column_split(layout: SectionLayoutResult) -> bool:
+def band_skips_vertical_column_split(
+    layout: SectionLayoutResult,
+    *,
+    band_lines: list[Line] | None = None,
+    page_width: float | None = None,
+) -> bool:
     """Per horizontal band: never column-split table-like or prose bands."""
     if (
         _layout_is_table_family(layout)
         and layout.confidence >= TABLE_LAYOUT_MIN_CONFIDENCE
     ):
+        if (
+            band_lines is not None
+            and page_width is not None
+            and analyze_vertical_partition(band_lines, page_width).allows_column_split()
+        ):
+            return False
         return True
     # Full-width paragraphs: vertical peel creates invalid strips (last word per line).
     if layout.layout_kind == "prose":

@@ -106,6 +106,19 @@ class Line:
         return box
 
 
+def _polygon_xy_lists(pts: list[Any]) -> tuple[list[float], list[float]]:
+    xs: list[float] = []
+    ys: list[float] = []
+    for p in pts:
+        if not isinstance(p, dict):
+            continue
+        if "x" in p:
+            xs.append(float(p["x"]))
+        if "y" in p:
+            ys.append(float(p["y"]))
+    return xs, ys
+
+
 def parse_bounds(raw: Any) -> Box | None:
     if not raw:
         return None
@@ -119,13 +132,16 @@ def parse_bounds(raw: Any) -> Box | None:
             )
         pts = raw.get("points")
         if pts:
-            xs = [float(p["x"]) for p in pts]
-            ys = [float(p["y"]) for p in pts]
-            return Box(min(xs), min(ys), max(xs), max(ys))
-    if isinstance(raw, list) and raw and isinstance(raw[0], dict) and "x" in raw[0]:
-        xs = [float(p["x"]) for p in raw]
-        ys = [float(p["y"]) for p in raw]
-        return Box(min(xs), min(ys), max(xs), max(ys))
+            xs, ys = _polygon_xy_lists(pts)
+            if xs and ys:
+                return Box(min(xs), min(ys), max(xs), max(ys))
+            return None
+    if isinstance(raw, list) and raw and isinstance(raw[0], dict):
+        if "x" in raw[0] or "y" in raw[0]:
+            xs, ys = _polygon_xy_lists(raw)
+            if xs and ys:
+                return Box(min(xs), min(ys), max(xs), max(ys))
+            return None
     return None
 
 

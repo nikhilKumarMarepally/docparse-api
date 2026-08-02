@@ -34,6 +34,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from section_table_layout import (  # noqa: E402
+    analyze_vertical_partition,
     band_skips_vertical_column_split,
     classify_section_layout,
     page_layout_from_horizontal_bands,
@@ -576,6 +577,20 @@ def _merge_page_top_stub(sections: list[Section], *, pad: float) -> list[Section
     return [_merge_two_sections(first, second, pad=pad)] + sections[2:]
 
 
+def _merge_page_bottom_stub(sections: list[Section], *, pad: float) -> list[Section]:
+    """Merge a short footer stub into the dominant band above when the gap is small."""
+    if len(sections) < 2:
+        return sections
+    prev, last = sections[-2], sections[-1]
+    if len(last.lines) > 8:
+        return sections
+    _, prev_y1 = _section_line_y_span(prev)
+    last_y0, _ = _section_line_y_span(last)
+    if last_y0 - prev_y1 > 60:
+        return sections
+    return sections[:-2] + [_merge_two_sections(prev, last, pad=pad)]
+
+
 def _clip_sections_to_column_bounds(
     sections: list[Section],
     *,
@@ -903,8 +918,8 @@ def lines_to_sections_hv_combined(
 ) -> tuple[list[Section], GapStats, dict[str, Any]]:
     """Horizontal gap bands first; subdivide only bands that contain a valid aligned column."""
     fw = full_width_lines if full_width_lines is not None else lines
-    page_words = _flatten_words(fw)
     gutter_x = estimate_page_gutter_x(fw, page_width)
+    v_partition = analyze_vertical_partition(fw, page_width)
 
     h_sections, h_stats = lines_to_sections(
         fw, multiplier=multiplier, min_gap_px=min_gap_px, pad=pad
@@ -912,27 +927,23 @@ def lines_to_sections_hv_combined(
     band_layouts = [classify_section_layout(sec.lines) for sec in h_sections]
     band_line_counts = [len(sec.lines) for sec in h_sections]
     page_layout = page_layout_from_horizontal_bands(band_line_counts, band_layouts)
+    # Pure / table-dominant pages: keep horizontal bands only.
+    # Do NOT override this with a full-height amount column — that peels
+    # label|value grids (RISC itemization, invoices) into fake L/R sections.
+    # Vertical splits are for mixed section+table pages only (per-band below).
     skip_vertical_for_table = table_layout_skips_vertical(
-        band_line_counts, band_layouts, all_lines=fw
+        band_line_counts, band_layouts, all_lines=fw, page_width=page_width
     )
     if skip_vertical_for_table:
-        page_col_probe = detect_aligned_text_column(
-            fw, page_width=page_width, gutter_x=gutter_x
-        )
-        if page_col_probe is not None and aligned_column_valid_for_vertical(
-            fw, page_col_probe
-        ) and _is_full_height_column(page_col_probe, fw):
-            skip_vertical_for_table = False
-    if skip_vertical_for_table:
-        h_sections = [
-            _recompute_section_box(s, pad=pad, all_words=page_words) for s in h_sections
-        ]
+        h_sections = _merge_page_top_stub(h_sections, pad=pad)
+        h_sections = _merge_page_bottom_stub(h_sections, pad=pad)
         return h_sections, h_stats, _layout_meta(
             page_col=None,
             gutter_x=gutter_x,
             mode="gap",
             page_layout=page_layout,
             table_gate=True,
+            vertical_partition=v_partition.to_dict(),
             horizontal_band_count=len(h_sections),
             split_horizontal_indices=[],
             section_roles=["horizontal"] * len(h_sections),
@@ -947,7 +958,12 @@ def lines_to_sections_hv_combined(
         else None
     )
 
-    if page_col_ref is not None and _is_full_height_column(page_col_ref, fw):
+    # Full-height column peel is for multi-section pages, not a lone table grid.
+    if (
+        page_col_ref is not None
+        and _is_full_height_column(page_col_ref, fw)
+        and page_layout != "table"
+    ):
         merged_secs, section_roles, combine_merges = _lines_to_sections_hv_full_column(
             lines,
             page_col_ref,
@@ -956,14 +972,9 @@ def lines_to_sections_hv_combined(
             multiplier=multiplier,
             min_gap_px=min_gap_px,
             pad=pad,
-            all_words=page_words,
         )
         sections = [
-            _recompute_section_box(
-                Section(idx, s.lines, s.text, s.box, s.gap_above),
-                pad=pad,
-                all_words=page_words,
-            )
+            Section(idx, s.lines, s.text, s.box, s.gap_above)
             for idx, s in enumerate(merged_secs)
         ]
         meta = _layout_meta(
@@ -984,7 +995,9 @@ def lines_to_sections_hv_combined(
     band_col_ref: Any | None = None
 
     for i, band_sec in enumerate(h_sections):
-        if band_skips_vertical_column_split(band_layouts[i]):
+        if band_skips_vertical_column_split(
+            band_layouts[i], band_lines=band_sec.lines, page_width=page_width
+        ):
             merged.append((band_sec, "horizontal"))
             continue
         band_y0, band_y1 = _section_line_y_span(band_sec)
@@ -1013,7 +1026,9 @@ def lines_to_sections_hv_combined(
             band_sec.lines,
             page_width=page_width,
             split_x=band_col.split_x,
-        ):
+        ) and not analyze_vertical_partition(
+            band_sec.lines, page_width
+        ).allows_column_split():
             merged.append((band_sec, "horizontal"))
             continue
 
@@ -1034,9 +1049,6 @@ def lines_to_sections_hv_combined(
         merged.extend(zip(split_secs, roles))
 
     if not split_band_indices:
-        h_sections = [
-            _recompute_section_box(s, pad=pad, all_words=page_words) for s in h_sections
-        ]
         return h_sections, h_stats, _layout_meta(
             page_col=None,
             gutter_x=gutter_x,
@@ -1049,11 +1061,7 @@ def lines_to_sections_hv_combined(
     merged.sort(key=lambda t: min(ln.content_box.min_y for ln in t[0].lines))
     section_roles = [role for _, role in merged]
     sections = [
-        _recompute_section_box(
-            Section(idx, sec.lines, sec.text, sec.box, sec.gap_above),
-            pad=pad,
-            all_words=page_words,
-        )
+        Section(idx, sec.lines, sec.text, sec.box, sec.gap_above)
         for idx, (sec, _) in enumerate(merged)
     ]
 
@@ -1064,6 +1072,7 @@ def lines_to_sections_hv_combined(
         horizontal_band_count=len(h_sections),
         split_horizontal_indices=split_band_indices,
         section_roles=section_roles,
+        vertical_partition=v_partition.to_dict(),
     )
     return sections, h_stats, meta
 
