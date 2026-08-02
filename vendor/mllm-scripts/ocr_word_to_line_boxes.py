@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import statistics
 import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -195,6 +196,38 @@ def combine_phrase(parts: list[str]) -> str:
     return " ".join(result)
 
 
+def split_row_by_horizontal_gaps(
+    row: list[Word],
+    *,
+    prose: bool = True,
+    min_gap_px: float = 20.0,
+) -> list[list[Word]]:
+    """Split a word row at every horizontal whitespace gap above threshold."""
+    if len(row) < 2:
+        return [row]
+    ordered = sorted(row, key=lambda w: w.box.min_x)
+    gaps = [ordered[i].box.min_x - ordered[i - 1].box.max_x for i in range(1, len(ordered))]
+    widths = [w.box.width for w in ordered]
+    med_w = statistics.median(widths) if widths else 12.0
+    positive = [g for g in gaps if g > 0]
+    if not positive:
+        return [ordered]
+    min_gap = min(positive)
+    if prose:
+        threshold = max(min_gap_px, min_gap * 3.5, med_w * 0.85)
+    else:
+        med_gap = statistics.median(positive)
+        threshold = max(med_gap * 2.5, med_w * 1.25, 10.0)
+
+    chunks: list[list[Word]] = [[ordered[0]]]
+    for word, gap in zip(ordered[1:], gaps):
+        if gap > threshold:
+            chunks.append([word])
+        else:
+            chunks[-1].append(word)
+    return chunks
+
+
 def split_row_by_column_gutter(
     row: list[Word],
     *,
@@ -250,7 +283,12 @@ def words_to_lines(
 ) -> list[Line]:
     lines: list[Line] = []
     for row in group_into_rows(words):
-        chunks = split_row_by_column_gutter(row) if split_columns else [row]
+        if split_columns:
+            chunks: list[list[Word]] = []
+            for chunk in split_row_by_horizontal_gaps(row, prose=True):
+                chunks.extend(split_row_by_column_gutter(chunk))
+        else:
+            chunks = [row]
         for chunk in chunks:
             chunk.sort(key=lambda w: w.box.min_x)
             text = combine_phrase([w.text for w in chunk])

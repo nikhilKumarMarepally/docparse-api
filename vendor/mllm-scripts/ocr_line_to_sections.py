@@ -201,6 +201,65 @@ def _section_looks_like_table_row_band(section: Section) -> bool:
     return False
 
 
+def _split_section_by_horizontal_lanes(section: Section, *, pad: float) -> list[Section]:
+    """Split a prose section when lines occupy disjoint horizontal lanes (e.g. side-by-side charts)."""
+    lines = sorted(section.lines, key=lambda ln: ln.content_box.min_y)
+    if len(lines) < 2:
+        return [section]
+
+    lanes: list[list[Line]] = []
+    for line in lines:
+        best_idx = -1
+        best_overlap = 0.0
+        for idx, lane in enumerate(lanes):
+            overlap = max(
+                _box_x_overlap_frac(line.content_box, ln.content_box) for ln in lane
+            )
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_idx = idx
+        if best_idx >= 0 and best_overlap >= 0.12:
+            lanes[best_idx].append(line)
+        else:
+            lanes.append([line])
+
+    if len(lanes) <= 1:
+        return [section]
+
+    lane_boxes: list[Box] = []
+    for lane in lanes:
+        box = lane[0].content_box
+        for ln in lane[1:]:
+            box = box.union(ln.content_box)
+        lane_boxes.append(box)
+    lane_boxes.sort(key=lambda b: b.min_x)
+
+    separations = [
+        lane_boxes[i + 1].min_x - lane_boxes[i].max_x
+        for i in range(len(lane_boxes) - 1)
+    ]
+    min_sep = max(24.0, section.box.width * 0.035)
+    if not separations or max(separations) < min_sep:
+        return [section]
+
+    return [_make_section(0, lane, section.gap_above, pad) for lane in lanes]
+
+
+def split_prose_sections_by_lanes(sections: list[Section], *, pad: float) -> list[Section]:
+    """Break non-table sections apart when content sits in separated horizontal lanes."""
+    out: list[Section] = []
+    for sec in sections:
+        if _section_looks_like_table_row_band(sec):
+            out.append(sec)
+            continue
+        lay = classify_section_layout(sec.lines)
+        if lay.layout_kind in ("table", "section_table"):
+            out.append(sec)
+            continue
+        out.extend(_split_section_by_horizontal_lanes(sec, pad=pad))
+    return [_make_section(i, s.lines, s.gap_above, pad) for i, s in enumerate(out)]
+
+
 def merge_adjacent_table_row_bands(sections: list[Section], *, pad: float) -> list[Section]:
     """Glue consecutive thin gap bands when combined geometry is a table grid."""
     if len(sections) < 2:
@@ -937,6 +996,7 @@ def lines_to_sections_hv_combined(
     if skip_vertical_for_table:
         h_sections = _merge_page_top_stub(h_sections, pad=pad)
         h_sections = _merge_page_bottom_stub(h_sections, pad=pad)
+        h_sections = split_prose_sections_by_lanes(h_sections, pad=pad)
         return h_sections, h_stats, _layout_meta(
             page_col=None,
             gutter_x=gutter_x,
@@ -977,6 +1037,7 @@ def lines_to_sections_hv_combined(
             Section(idx, s.lines, s.text, s.box, s.gap_above)
             for idx, s in enumerate(merged_secs)
         ]
+        sections = split_prose_sections_by_lanes(sections, pad=pad)
         meta = _layout_meta(
             page_col=page_col_ref,
             gutter_x=gutter_x,
@@ -1049,6 +1110,7 @@ def lines_to_sections_hv_combined(
         merged.extend(zip(split_secs, roles))
 
     if not split_band_indices:
+        h_sections = split_prose_sections_by_lanes(h_sections, pad=pad)
         return h_sections, h_stats, _layout_meta(
             page_col=None,
             gutter_x=gutter_x,
@@ -1064,6 +1126,7 @@ def lines_to_sections_hv_combined(
         Section(idx, sec.lines, sec.text, sec.box, sec.gap_above)
         for idx, (sec, _) in enumerate(merged)
     ]
+    sections = split_prose_sections_by_lanes(sections, pad=pad)
 
     meta = _layout_meta(
         page_col=page_col_ref or band_col_ref,
