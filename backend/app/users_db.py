@@ -16,14 +16,36 @@ logger = logging.getLogger(__name__)
 
 _TABLE = os.environ.get("DOC_EXTRACT_USERS_TABLE", "docparse_users")
 _LEDGER = "credit_ledger"
-INITIAL_CREDITS = int(os.environ.get("DOC_EXTRACT_INITIAL_CREDITS", "2"))
+INITIAL_CREDITS = int(os.environ.get("DOC_EXTRACT_INITIAL_CREDITS", "20"))
 CREDITS_PER_DOCUMENT = int(os.environ.get("DOC_EXTRACT_CREDITS_PER_DOC", "2"))
+CREDITS_PER_PAGE = int(os.environ.get("DOC_EXTRACT_CREDITS_PER_PAGE", str(CREDITS_PER_DOCUMENT)))
+
+
+def extraction_cost(page_count: int) -> int:
+    return max(1, page_count) * CREDITS_PER_PAGE
 
 
 class InsufficientCreditsError(Exception):
     def __init__(self, balance: int) -> None:
         self.balance = balance
         super().__init__(f"insufficient credits (balance={balance})")
+
+
+def insufficient_credits_message() -> str:
+    free_pages = max(1, INITIAL_CREDITS // CREDITS_PER_PAGE)
+    return (
+        f"You ran out of credits. Each page costs {CREDITS_PER_PAGE} credits; "
+        f"new accounts start with {INITIAL_CREDITS} credits ({free_pages} free pages)."
+    )
+
+
+def insufficient_credits_for_pages(page_count: int, balance: int, cost: int) -> str:
+    page_label = "page" if page_count == 1 else "pages"
+    return (
+        f"Not enough credits. This document has {page_count} {page_label} "
+        f"and costs {cost} credits ({CREDITS_PER_PAGE} per page). "
+        f"Your balance is {balance}."
+    )
 
 
 def _db_path() -> Path:
@@ -220,7 +242,7 @@ def verify_email_login(email: str, password_hash_check) -> dict[str, Any] | None
 
 
 def spend_credits_for_job(user_id: str, job_id: str, *, amount: int | None = None) -> int:
-    cost = amount if amount is not None else CREDITS_PER_DOCUMENT
+    cost = amount if amount is not None else CREDITS_PER_PAGE
     ensure_users_table()
     now = _now()
     with _connect() as conn:
@@ -313,4 +335,5 @@ def users_db_status() -> dict[str, Any]:
         "exists": path.is_file() and table_ok,
         "initial_credits": INITIAL_CREDITS,
         "credits_per_document": CREDITS_PER_DOCUMENT,
+        "credits_per_page": CREDITS_PER_PAGE,
     }

@@ -28,9 +28,19 @@ def _pdf_page_count(pdf_path: Path) -> int:
         import fitz
 
         with fitz.open(pdf_path) as doc:
-            return doc.page_count
-    except Exception:
+            return max(1, doc.page_count)
+    except Exception as exc:
+        raise ValueError(f"Could not read PDF page count: {exc}") from exc
+
+
+def count_upload_pages(upload_path: Path) -> int:
+    """Return the number of billable pages for an uploaded PDF or image."""
+    suffix = upload_path.suffix.lower()
+    if suffix in SUPPORTED_PDF_SUFFIXES:
+        return _pdf_page_count(upload_path)
+    if suffix in SUPPORTED_IMAGE_SUFFIXES:
         return 1
+    raise ValueError(f"Unsupported file type: {suffix}")
 
 
 def _rasterize_pdf_pdftoppm(pdf_path: Path, out_dir: Path, page: int) -> Path | None:
@@ -86,8 +96,7 @@ def ingest_upload(upload_path: Path, job_dir: Path) -> list[Path]:
     pages_dir.mkdir(parents=True, exist_ok=True)
 
     if suffix in SUPPORTED_PDF_SUFFIXES:
-        raw_pages = rasterize_pdf(upload_path, pages_dir / "raw")
-        return raw_pages
+        return rasterize_pdf(upload_path, pages_dir)
 
     if suffix in SUPPORTED_IMAGE_SUFFIXES:
         dest = pages_dir / "page_000.png"

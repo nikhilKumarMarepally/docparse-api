@@ -21,11 +21,15 @@ from app.auth import (
     register_with_email,
     verify_session_token,
 )
+from app.ingest import count_upload_pages
 from app.users_db import (
     CREDITS_PER_DOCUMENT,
+    CREDITS_PER_PAGE,
     InsufficientCreditsError,
     ensure_users_table,
+    extraction_cost,
     get_user_by_id,
+    insufficient_credits_for_pages,
     spend_credits_for_job,
 )
 from app.users_db import users_db_status
@@ -149,6 +153,7 @@ def auth_config() -> dict:
         "google_client_id": google_client_id(),
         "initial_credits": INITIAL_CREDITS,
         "credits_per_document": CREDITS_PER_DOCUMENT,
+        "credits_per_page": CREDITS_PER_PAGE,
     }
 
 
@@ -207,6 +212,38 @@ def sample_overlay(doc_type: str) -> FileResponse:
     raise HTTPException(status_code=404, detail="Sample not found")
 
 
+@app.post("/api/jobs/estimate")
+async def estimate_job_cost(file: UploadFile = File(...)) -> dict[str, int]:
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Missing filename")
+
+    suffix = Path(file.filename).suffix.lower()
+    if suffix not in ALLOWED_SUFFIXES:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {suffix}")
+
+    data = await file.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="File exceeds 20 MB limit")
+
+    JOB_ROOT.mkdir(parents=True, exist_ok=True)
+    tmp = JOB_ROOT / f"_estimate_{file.filename}"
+    tmp.write_bytes(data)
+    try:
+        page_count = count_upload_pages(tmp)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+    cost = extraction_cost(page_count)
+    return {
+        "page_count": page_count,
+        "credits_per_page": CREDITS_PER_PAGE,
+        "credits_required": cost,
+    }
+
+
 @app.post("/api/jobs")
 async def upload_job(
     file: UploadFile = File(...),
@@ -215,20 +252,6 @@ async def upload_job(
 ) -> dict[str, str | int]:
     if not file.filename:
         raise HTTPException(status_code=400, detail="Missing filename")
-
-    credits_remaining: int | None = None
-    if auth_required() and user:
-        uid = str(user["sub"])
-        account = get_user_by_id(uid)
-        balance = account["credits"] if account else 0
-        if balance < CREDITS_PER_DOCUMENT:
-            raise HTTPException(
-                status_code=402,
-                detail=(
-                    "You ran out of credits. Each document costs 2 credits; "
-                    "new accounts start with 2 credits (one free document)."
-                ),
-            )
 
     suffix = Path(file.filename).suffix.lower()
     if suffix not in ALLOWED_SUFFIXES:
@@ -241,25 +264,48 @@ async def upload_job(
     JOB_ROOT.mkdir(parents=True, exist_ok=True)
     tmp = JOB_ROOT / f"_upload_{file.filename}"
     tmp.write_bytes(data)
+
+    page_count = 1
+    cost = CREDITS_PER_PAGE
+    credits_remaining: int | None = None
+
     try:
+        try:
+            page_count = count_upload_pages(tmp)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        cost = extraction_cost(page_count)
+
+        if auth_required() and user:
+            uid = str(user["sub"])
+            account = get_user_by_id(uid)
+            balance = account["credits"] if account else 0
+            if balance < cost:
+                raise HTTPException(
+                    status_code=402,
+                    detail=insufficient_credits_for_pages(page_count, balance, cost),
+                )
+
         job = create_job(tmp, file.filename, skip_llm=skip_llm)
+
+        if auth_required() and user:
+            try:
+                credits_remaining = spend_credits_for_job(str(user["sub"]), job.job_id, amount=cost)
+            except InsufficientCreditsError:
+                raise HTTPException(
+                    status_code=402,
+                    detail=insufficient_credits_for_pages(page_count, 0, cost),
+                )
     finally:
         if tmp.exists():
             tmp.unlink()
 
-    if auth_required() and user:
-        try:
-            credits_remaining = spend_credits_for_job(str(user["sub"]), job.job_id)
-        except InsufficientCreditsError:
-            raise HTTPException(
-                status_code=402,
-                detail=(
-                    "You ran out of credits. Each document costs 2 credits; "
-                    "new accounts start with 2 credits (one free document)."
-                ),
-            )
-
-    payload: dict[str, str | int] = {"job_id": job.job_id}
+    payload: dict[str, str | int] = {
+        "job_id": job.job_id,
+        "page_count": page_count,
+        "credits_charged": cost,
+    }
     if credits_remaining is not None:
         payload["credits_remaining"] = credits_remaining
     return payload
@@ -307,11 +353,19 @@ def job_status(job_id: str) -> dict:
 
 @app.get("/api/jobs/{job_id}/pages/{page_index}/source.png")
 def page_source(job_id: str, page_index: int) -> FileResponse:
-    rel = f"pages/page_{page_index:03d}.png"
-    path = job_file_path(job_id, rel)
-    if path is None:
-        path = JOB_ROOT / job_id / rel
-    if not path.exists():
+    candidates = [
+        f"pages/page_{page_index:03d}.png",
+        f"pages/raw/page_{page_index:03d}.png",
+    ]
+    path = None
+    for rel in candidates:
+        path = job_file_path(job_id, rel)
+        if path is None:
+            path = JOB_ROOT / job_id / rel
+        if path.exists():
+            break
+        path = None
+    if path is None or not path.exists():
         raise HTTPException(status_code=404, detail="Page image not found")
     return FileResponse(path, media_type="image/png")
 

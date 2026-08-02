@@ -13,6 +13,7 @@ from google.oauth2 import id_token
 
 from app.users_db import (
     CREDITS_PER_DOCUMENT,
+    CREDITS_PER_PAGE,
     INITIAL_CREDITS,
     register_email_user,
     upsert_google_user,
@@ -97,6 +98,7 @@ def auth_response_from_user(user: dict[str, Any]) -> dict[str, Any]:
             "credits": user.get("credits", 0),
         },
         "credits_per_document": CREDITS_PER_DOCUMENT,
+        "credits_per_page": CREDITS_PER_PAGE,
         "initial_credits": INITIAL_CREDITS,
     }
 
@@ -179,5 +181,6 @@ def me_from_token_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "picture": payload.get("picture"),
         "credits": credits,
         "credits_per_document": CREDITS_PER_DOCUMENT,
+        "credits_per_page": CREDITS_PER_PAGE,
         "initial_credits": INITIAL_CREDITS,
     }
