@@ -265,6 +265,31 @@ async def upload_job(
     return payload
 
 
+def _slim_job_payload(payload: dict) -> dict:
+    """Drop bulky per-word style arrays from API responses (not used by the web UI)."""
+    pages = payload.get("pages")
+    if not isinstance(pages, list):
+        return payload
+    slim_pages = []
+    for page in pages:
+        if not isinstance(page, dict):
+            slim_pages.append(page)
+            continue
+        sections = page.get("sections")
+        if not isinstance(sections, list):
+            slim_pages.append(page)
+            continue
+        slim_sections = []
+        for section in sections:
+            if isinstance(section, dict):
+                slim = {k: v for k, v in section.items() if k != "word_styles"}
+                slim_sections.append(slim)
+            else:
+                slim_sections.append(section)
+        slim_pages.append({**page, "sections": slim_sections})
+    return {**payload, "pages": slim_pages}
+
+
 @app.get("/api/jobs/{job_id}")
 def job_status(job_id: str) -> dict:
     job = get_job(job_id)
@@ -275,9 +300,9 @@ def job_status(job_id: str) -> dict:
 
             payload = json.loads(result_path.read_text())
             payload["status"] = "completed"
-            return payload
+            return _slim_job_payload(payload)
         raise HTTPException(status_code=404, detail="Job not found")
-    return job.to_dict()
+    return _slim_job_payload(job.to_dict())
 
 
 @app.get("/api/jobs/{job_id}/pages/{page_index}/overlay.png")
