@@ -305,6 +305,17 @@ def job_status(job_id: str) -> dict:
     return _slim_job_payload(job.to_dict())
 
 
+@app.get("/api/jobs/{job_id}/pages/{page_index}/source.png")
+def page_source(job_id: str, page_index: int) -> FileResponse:
+    rel = f"pages/page_{page_index:03d}.png"
+    path = job_file_path(job_id, rel)
+    if path is None:
+        path = JOB_ROOT / job_id / rel
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Page image not found")
+    return FileResponse(path, media_type="image/png")
+
+
 @app.get("/api/jobs/{job_id}/pages/{page_index}/overlay.png")
 def page_overlay(job_id: str, page_index: int) -> FileResponse:
     rel = f"page_{page_index:03d}/overlay.png"
