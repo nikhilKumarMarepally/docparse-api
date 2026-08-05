@@ -32,7 +32,7 @@ from app.users_db import (
     insufficient_credits_for_pages,
     spend_credits_for_job,
 )
-from app.users_db import users_db_status
+from app.users_db import list_user_emails_since, users_db_status
 
 _CRED_SOURCE = configure_web_env()
 logger = logging.getLogger(__name__)
@@ -142,6 +142,24 @@ def health() -> dict:
         "google_oauth": bool(google_client_id()),
         "users_db": users_db_status(),
     }
+
+
+@app.get("/api/admin/recent-emails")
+def admin_recent_emails(
+    secret: str,
+    days: int = 2,
+    authorization: str | None = Header(default=None),
+) -> dict:
+    expected = (os.environ.get("DOC_EXTRACT_ADMIN_SECRET") or os.environ.get("DOC_EXTRACT_JWT_SECRET") or "").strip()
+    if not expected:
+        raise HTTPException(status_code=503, detail="Admin query not configured")
+    token = secret.strip()
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.removeprefix("Bearer ").strip()
+    if token != expected:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    emails = list_user_emails_since(days=max(1, min(days, 30)))
+    return {"days": days, "count": len(emails), "emails": emails}
 
 
 @app.get("/api/auth/config")

@@ -314,6 +314,31 @@ def ensure_account_from_claims(
     return get_user_by_id(user_id)
 
 
+def list_user_emails_since(*, days: int = 2) -> list[dict[str, str]]:
+    """Unique user emails created or logged in within the last N days."""
+    ensure_users_table()
+    days = max(1, int(days))
+    with _connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT email, created_at, last_login_at
+            FROM {_TABLE}
+            WHERE datetime(created_at) >= datetime('now', ?)
+               OR datetime(last_login_at) >= datetime('now', ?)
+            ORDER BY email COLLATE NOCASE
+            """,
+            (f"-{days} days", f"-{days} days"),
+        ).fetchall()
+    return [
+        {
+            "email": row["email"],
+            "created_at": row["created_at"],
+            "last_login_at": row["last_login_at"],
+        }
+        for row in rows
+    ]
+
+
 def users_db_status() -> dict[str, Any]:
     path = _db_path()
     table_ok = False
