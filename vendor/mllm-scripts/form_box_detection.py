@@ -20,6 +20,7 @@ class FormBox:
     area: float
     contour_area: float
     depth: int  # nesting level from findContours hierarchy
+    confidence: float = 0.0
 
     @property
     def x2(self) -> int:
@@ -117,6 +118,7 @@ def detect_printed_boxes(
                 area=area,
                 contour_area=float(cv2.contourArea(cnt)),
                 depth=depth,
+                confidence=round(float(rect_score), 4),
             )
         )
 
@@ -259,6 +261,7 @@ def detect_column_panels(
                 area=b.area,
                 contour_area=b.contour_area,
                 depth=b.depth,
+                confidence=b.confidence,
             )
         )
     panels.sort(key=lambda b: b.x)
@@ -285,3 +288,16 @@ def detect_form_sections(image_bgr: np.ndarray) -> list[FormBox]:
         merged.sort(key=lambda b: (b.y, b.x))
         return _suppress_nested_duplicates(merged, iou_thresh=0.85)
     return sections
+
+
+def detect_high_confidence_sections(
+    image_bgr: np.ndarray,
+    *,
+    min_confidence: float = 0.9,
+) -> list[FormBox]:
+    """OpenCV printed frames with rectangularity >= min_confidence."""
+    return [
+        box
+        for box in detect_form_sections(image_bgr)
+        if box.confidence >= min_confidence
+    ]
