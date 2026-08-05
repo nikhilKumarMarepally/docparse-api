@@ -66,7 +66,10 @@ class SectionPipelineHandler:
         if ctx.column_meta:
             ctx.section_meta["horizontal"] = ctx.column_meta
         if ctx.gap_stats_obj is not None:
-            ctx.section_meta["gap_stats"] = ctx.gap_stats_obj
+            gs = ctx.gap_stats_obj
+            ctx.section_meta["gap_stats"] = (
+                gs.to_dict() if hasattr(gs, "to_dict") else gs
+            )
 
 
 def run_page_section_pipeline(
