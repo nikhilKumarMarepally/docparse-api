@@ -6,7 +6,6 @@ Clusters word min_x per row; needs ≥3 aligned columns on several rows + unifor
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from statistics import median
 from typing import Any
@@ -20,11 +19,16 @@ from ocr_word_to_line_boxes import (
     group_into_rows,
 )
 
-_AMOUNT_LIKE = re.compile(r"^\s*\$?\s*[\d,]+\.\d{2}\s*$")
 
-
-def _text_is_amount_like(text: str) -> bool:
-    return bool(_AMOUNT_LIKE.match(text.strip()))
+def _cell_looks_numeric(cell: list[Word]) -> bool:
+    """Numeric cell from digit density — no currency/text patterns."""
+    if not cell:
+        return False
+    chars = sum(len(w.text) for w in cell)
+    if chars < 1:
+        return False
+    digits = sum(sum(1 for c in w.text if c.isdigit()) for w in cell)
+    return digits / chars >= 0.45
 
 
 @dataclass(frozen=True)
@@ -103,8 +107,7 @@ def analyze_vertical_partition(lines: list[Line], page_width: float) -> Vertical
             left_only += 1
         elif has_right:
             right_only += 1
-            row_text = " ".join(w.text for c in right_cells for w in c)
-            if _text_is_amount_like(row_text):
+            if any(_cell_looks_numeric(c) for c in right_cells):
                 right_only_amount += 1
 
     total_rows = coupled + left_only + right_only
@@ -467,6 +470,26 @@ def table_layout_skips_vertical(
     return False
 
 
+def _band_has_narrow_left_sidebar(
+    band_lines: list[Line],
+    page_width: float,
+) -> bool:
+    """True when a band has stamp lines in the left margin strip (arXiv date sidebar)."""
+    if not band_lines or page_width <= 0:
+        return False
+    margin_hi = page_width * 0.10
+    for ln in band_lines:
+        cb = ln.content_box
+        if cb.min_x <= margin_hi * 0.5 and cb.max_x <= margin_hi:
+            if cb.height / max(1.0, cb.width) >= 0.8:
+                return True
+        if ln.words:
+            v = sum(1 for w in ln.words if w.box.max_x <= margin_hi)
+            if v >= max(1, len(ln.words) * 0.5) and cb.max_x <= margin_hi * 1.2:
+                return True
+    return False
+
+
 def band_skips_vertical_column_split(
     layout: SectionLayoutResult,
     *,
@@ -478,12 +501,14 @@ def band_skips_vertical_column_split(
         _layout_is_table_family(layout)
         and layout.confidence >= TABLE_LAYOUT_MIN_CONFIDENCE
     ):
-        if (
-            band_lines is not None
-            and page_width is not None
-            and analyze_vertical_partition(band_lines, page_width).allows_column_split()
-        ):
-            return False
+        if band_lines is not None and page_width is not None:
+            part = analyze_vertical_partition(band_lines, page_width)
+            if _band_has_narrow_left_sidebar(band_lines, page_width) and not part.is_unified_grid:
+                return False
+            if part.is_unified_grid:
+                return True
+            if part.allows_column_split():
+                return False
         return True
     # Full-width paragraphs: vertical peel creates invalid strips (last word per line).
     if layout.layout_kind == "prose":

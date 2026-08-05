@@ -7,6 +7,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
 
+import cv2
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from app.extract.gemini import GeminiExtractor, get_extractor
@@ -14,6 +16,7 @@ from app.extract.section_gate import get_section_gate, gate_min_confidence, sect
 from app.ocr import run_ocr
 from app.paths import ensure_script_path
 from app.section_crop import crop_section_image, enhance_section_crop
+from app.section_merge import section_dict_structurally_table
 from app.text_weight import (
     annotate_word_styles,
     bold_text_in_section,
@@ -26,12 +29,9 @@ logger = logging.getLogger(__name__)
 
 ensure_script_path()
 
-from ocr_line_to_sections import (  # noqa: E402
-    _make_section,
-    lines_to_sections_hv_combined,
-)
-from ocr_word_to_line_boxes import load_words, words_to_lines  # noqa: E402
-from section_layout_breaks import lines_to_sections_human  # noqa: E402
+from app.section_pipeline import run_page_section_pipeline  # noqa: E402
+from ocr_line_to_sections import gap_stats  # noqa: E402
+from ocr_word_to_line_boxes import load_words  # noqa: E402
 from section_preprocess import annotate_preprocess  # noqa: E402
 from section_table_layout import classify_section_layout  # noqa: E402
 
@@ -51,6 +51,95 @@ def _section_label(text: str, index: int) -> str:
     return f"section_{index}"
 
 
+def _sections_objs_to_dicts(sections_obj: list[Any]) -> list[dict[str, Any]]:
+    return [
+        s.to_dict(layout=classify_section_layout(s.lines).to_dict())
+        for s in sections_obj
+    ]
+
+
+def build_page_sections_snapshots(
+    vision: dict[str, Any],
+    words: list[Any],
+    *,
+    page_width: float,
+    page_rgb: Image.Image,
+) -> tuple[list[tuple[str, list[dict[str, Any]]]], dict[str, Any], list[Any]]:
+    """
+    Same stages as build_page_sections, returning (stage_name, section_dicts)
+    after each geometry step. Does not affect production callers.
+    """
+    ctx = run_page_section_pipeline(
+        vision,
+        words,
+        page_width=page_width,
+        page_rgb=page_rgb,
+        record_snapshots=True,
+        include_optional=True,
+    )
+    snapshots = list(ctx.snapshots)
+    drop_dicts = _sections_objs_to_dicts(ctx.sections)
+    drop_dicts = drop_contained_inner_sections(
+        drop_dicts,
+        lines=ctx.fw_lines,
+        page_width=float(page_width),
+    )
+    snapshots.append(("drop_contained", drop_dicts))
+    return snapshots, ctx.section_meta, ctx.fw_lines, list(ctx.opencv_boxes)
+
+
+def build_page_sections(
+    vision: dict[str, Any],
+    words: list[Any],
+    *,
+    page_width: float,
+    page_rgb: Image.Image,
+) -> tuple[list[Any], dict[str, Any], list[Any]]:
+    """
+    Single production sectioning path via SectionPipelineHandler.
+    """
+    ctx = run_page_section_pipeline(
+        vision,
+        words,
+        page_width=page_width,
+        page_rgb=page_rgb,
+        record_snapshots=False,
+        include_optional=True,
+    )
+    return ctx.sections, ctx.section_meta, ctx.fw_lines
+
+
+def annotate_production_sections(
+    vision: dict[str, Any],
+    words: list[Any],
+    *,
+    page_width: float,
+    page_rgb: Image.Image,
+    document_type: str = "generic",
+) -> tuple[list[dict[str, Any]], dict[str, Any], list[Any]]:
+    """Same section dicts as process_page after preprocess (bounds match API / Vercel UI)."""
+    sections_obj, section_meta, lines = build_page_sections(
+        vision,
+        words,
+        page_width=page_width,
+        page_rgb=page_rgb,
+    )
+    raw_sections = [
+        s.to_dict(layout=classify_section_layout(s.lines).to_dict()) for s in sections_obj
+    ]
+    no_fasttext = Path("/nonexistent/fasttext.bin")
+    annotated = [
+        annotate_preprocess(
+            section,
+            document_type=document_type,
+            boilerplate_model=no_fasttext,
+            field_model=no_fasttext,
+        )
+        for section in raw_sections
+    ]
+    return annotated, section_meta, lines
+
+
 def _merge_fields(target: dict[str, Any], source: dict[str, Any], warnings: list[str], *, page: int, section: int) -> None:
     for key, value in source.items():
         if key in target and target[key] != value:
@@ -61,6 +150,174 @@ def _merge_fields(target: dict[str, Any], source: dict[str, Any], warnings: list
         target[key] = value
 
 
+def _section_bounds_area(bounds: dict[str, Any]) -> float:
+    return max(
+        0.0,
+        float(bounds.get("max_x", 0) - bounds.get("min_x", 0))
+        * float(bounds.get("max_y", 0) - bounds.get("min_y", 0)),
+    )
+
+
+def _section_bounds_overlap(inner: dict[str, Any], outer: dict[str, Any]) -> float:
+    x0 = max(float(inner.get("min_x", 0)), float(outer.get("min_x", 0)))
+    y0 = max(float(inner.get("min_y", 0)), float(outer.get("min_y", 0)))
+    x1 = min(float(inner.get("max_x", 0)), float(outer.get("max_x", 0)))
+    y1 = min(float(inner.get("max_y", 0)), float(outer.get("max_y", 0)))
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    return (x1 - x0) * (y1 - y0)
+
+
+def _section_preprocess_kept(section: dict[str, Any]) -> bool:
+    if "preprocess_kept" in section:
+        return bool(section.get("preprocess_kept"))
+    prep = section.get("preprocess") or {}
+    return bool(prep.get("kept", True))
+
+
+def drop_overlapping_bounds_sections(
+    sections: list[dict[str, Any]],
+    *,
+    contain_frac: float = 0.82,
+    area_ratio: float = 1.08,
+) -> list[dict[str, Any]]:
+    """Drop wrapper bounds when a smaller section already covers the same ink."""
+    if len(sections) < 2:
+        return sections
+    drop_indices: set[int] = set()
+    for outer in sections:
+        ob = outer.get("bounds") or {}
+        outer_area = _section_bounds_area(ob)
+        if outer_area <= 0:
+            continue
+        for inner in sections:
+            if inner.get("index") == outer.get("index"):
+                continue
+            ib = inner.get("bounds") or {}
+            inner_area = _section_bounds_area(ib)
+            if inner_area <= 0 or inner_area >= outer_area:
+                continue
+            overlap = _section_bounds_overlap(ib, ob)
+            if overlap >= inner_area * contain_frac and outer_area > inner_area * area_ratio:
+                drop_indices.add(int(outer.get("index", -1)))
+                break
+    if not drop_indices:
+        return sections
+    return [s for s in sections if int(s.get("index", -1)) not in drop_indices]
+
+
+def drop_contained_inner_sections(
+    sections: list[dict[str, Any]],
+    *,
+    contain_frac: float = 0.85,
+    min_area_ratio: float = 1.12,
+    lines: list[Any] | None = None,
+    page_width: float = 0.0,
+) -> list[dict[str, Any]]:
+    """Drop small sections whose bounds lie mostly inside a larger section (no nested boxes)."""
+    if len(sections) < 2:
+        return sections
+    drop_indices: set[int] = set()
+    for inner in sections:
+        if section_dict_structurally_table(inner, lines, page_width):
+            continue
+        ib = inner.get("bounds") or {}
+        inner_area = _section_bounds_area(ib)
+        if inner_area <= 0:
+            continue
+        for outer in sections:
+            if inner.get("index") == outer.get("index"):
+                continue
+            ob = outer.get("bounds") or {}
+            outer_area = _section_bounds_area(ob)
+            if outer_area <= 0 or inner_area >= outer_area / min_area_ratio:
+                continue
+            overlap = _section_bounds_overlap(ib, ob)
+            if overlap >= inner_area * contain_frac:
+                drop_indices.add(int(inner.get("index", -1)))
+                break
+    if not drop_indices:
+        return sections
+    return [s for s in sections if int(s.get("index", -1)) not in drop_indices]
+
+
+def drop_redundant_overlay_sections(
+    sections: list[dict[str, Any]],
+    *,
+    overlap_frac: float = 0.55,
+    min_children: int = 2,
+    touch_gap_px: float = 12.0,
+) -> list[dict[str, Any]]:
+    """
+    Drop wrapper sections whose inner content is already covered by finer sections.
+    - Container: >= min_children sections are mostly inside this box.
+    - Touching section_table bands: drop the upper band when a lower band overlaps
+      (inner boxes already covered by the lower section).
+    """
+    sections = drop_overlapping_bounds_sections(sections)
+    if len(sections) < 2:
+        return sections
+
+    drop_indices: set[int] = set()
+
+    for sec in sections:
+        outer = sec.get("bounds") or {}
+        if not outer:
+            continue
+        outer_area = _section_bounds_area(outer)
+        if outer_area <= 0:
+            continue
+        inside = 0
+        for other in sections:
+            if other.get("index") == sec.get("index"):
+                continue
+            inner = other.get("bounds") or {}
+            inner_area = _section_bounds_area(inner)
+            if inner_area <= 0:
+                continue
+            overlap = _section_bounds_overlap(inner, outer)
+            if overlap >= inner_area * overlap_frac:
+                inside += 1
+        if inside >= min_children:
+            drop_indices.add(int(sec.get("index", -1)))
+
+    table_secs = [
+        s for s in sections if (s.get("layout_kind") or "") == "section_table"
+    ]
+    table_secs.sort(key=lambda s: float((s.get("bounds") or {}).get("min_y", 0)))
+    for i, upper in enumerate(table_secs):
+        ub = upper.get("bounds") or {}
+        for lower in table_secs[i + 1:]:
+            lb = lower.get("bounds") or {}
+            overlap_y = min(float(ub.get("max_y", 0)), float(lb.get("max_y", 0))) - max(
+                float(ub.get("min_y", 0)), float(lb.get("min_y", 0))
+            )
+            if overlap_y >= touch_gap_px:
+                drop_indices.add(int(upper.get("index", -1)))
+                break
+
+    if not drop_indices:
+        return sections
+    return [s for s in sections if int(s.get("index", -1)) not in drop_indices]
+
+
+def sections_for_render_overlay(
+    sections: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """All Render sections with nested inner bounds removed (matches overlay.png)."""
+    sections = drop_contained_inner_sections(sections)
+    return drop_redundant_overlay_sections(sections)
+
+
+def sections_for_bounds_display(
+    sections: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Kept preprocess sections only (for extraction-focused views)."""
+    kept = [s for s in sections if _section_preprocess_kept(s)]
+    kept = drop_overlapping_bounds_sections(kept)
+    return drop_redundant_overlay_sections(kept, min_children=1, overlap_frac=0.75)
+
+
 def draw_filter_overlay(
     image_path: Path,
     sections: list[dict[str, Any]],
@@ -68,7 +325,10 @@ def draw_filter_overlay(
     *,
     overlay_title: str | None = None,
     overlay_mode: str = "preprocess",
+    apply_overlay_filters: bool = True,
 ) -> None:
+    if apply_overlay_filters:
+        sections = sections_for_render_overlay(sections)
     img = Image.open(image_path).convert("RGBA")
     draw = ImageDraw.Draw(img)
     try:
@@ -97,7 +357,7 @@ def draw_filter_overlay(
             if conf is not None and isinstance(conf, (int, float)):
                 kept = kept and float(conf) >= gate_min_confidence()
         else:
-            kept = bool(prep.get("kept", True))
+            kept = _section_preprocess_kept(section)
         color = (34, 160, 80) if kept else (220, 50, 50)
         draw.rectangle([(x0, y0), (x1, y1)], outline=color, width=4)
         idx = section.get("index", 0)
@@ -125,6 +385,7 @@ def process_page(
     *,
     on_step: Callable[[str], None] | None = None,
     skip_llm: bool = False,
+    reuse_vision: bool = False,
 ) -> dict[str, Any]:
     def step(msg: str) -> None:
         if on_step:
@@ -132,7 +393,10 @@ def process_page(
 
     step("ocr")
     vision_path = page_dir / "vision.json"
-    vision = run_ocr(page_png, vision_path)
+    if reuse_vision and vision_path.is_file() and vision_path.stat().st_size > 100:
+        vision = json.loads(vision_path.read_text())
+    else:
+        vision = run_ocr(page_png, vision_path)
 
     step("sections")
     words = load_words(vision)
@@ -140,35 +404,12 @@ def process_page(
         page_width = img.width
         page_rgb = img.convert("RGB")
 
-    use_human_layout = bool((vision.get("image_blocks") or {}).get("with_polygons"))
-    fw_lines = words_to_lines(words, page_width=page_width, full_width=True)
-    split_lines = words_to_lines(
+    sections_obj, section_meta, lines = build_page_sections(
+        vision,
         words,
-        page_width=page_width,
-        full_width=False,
-        split_columns=True,
+        page_width=float(page_width),
+        page_rgb=page_rgb,
     )
-
-    if use_human_layout:
-        human_chunks, _section_meta = lines_to_sections_human(
-            split_lines,
-            vision=vision,
-            page_width=float(page_width),
-            image_rgb=page_rgb,
-            min_gap_px=8.0,
-        )
-        sections_obj = [
-            _make_section(i, line_group, None, 6.0) for i, (line_group, _, _) in enumerate(human_chunks)
-        ]
-        lines = split_lines
-    else:
-        sections_obj, gap_stats, _column_meta = lines_to_sections_hv_combined(
-            split_lines,
-            page_width=float(page_width),
-            full_width_lines=fw_lines,
-            min_gap_px=18.0,
-        )
-        lines = fw_lines
 
     raw_sections = [
         s.to_dict(layout=classify_section_layout(s.lines).to_dict()) for s in sections_obj
@@ -187,6 +428,11 @@ def process_page(
         )
         for s in raw_sections
     ]
+    annotated = drop_contained_inner_sections(
+        annotated,
+        lines=lines,
+        page_width=float(page_width),
+    )
 
     crops_dir = page_dir / "crops"
     crops_dir.mkdir(parents=True, exist_ok=True)
@@ -367,6 +613,7 @@ def process_page(
         "field_styles": page_field_styles or None,
         "warnings": warnings,
         "overlay_path": str(overlay_path.relative_to(page_dir.parent.parent)),
+        "section_meta": section_meta,
     }
 
 

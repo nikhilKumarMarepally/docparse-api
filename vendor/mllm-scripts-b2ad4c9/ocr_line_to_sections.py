@@ -47,18 +47,12 @@ from ocr_word_to_line_boxes import (  # noqa: E402
     aligned_column_valid_for_vertical,
     detect_aligned_text_column,
     estimate_page_gutter_x,
-    is_vertical_angle,
     line_from_words,
-    line_is_vertical,
     load_font,
     load_vision,
     load_words,
-    median_positive_word_gap_from_lines,
-    column_gap_between_lines,
     partition_lines_at_column,
     resolve_paths,
-    split_lines_by_orientation_spacing,
-    word_is_vertical,
     words_to_lines,
 )
 
@@ -159,13 +153,12 @@ def lines_to_sections(
     if not lines:
         return [], GapStats([], 0.0, 0.0, min_gap_px)
 
-    ordered = sorted(lines, key=lambda ln: (ln.content_box.min_y, ln.content_box.min_x))
-    stats = gap_stats(ordered, multiplier=multiplier, min_gap_px=min_gap_px)
+    stats = gap_stats(lines, multiplier=multiplier, min_gap_px=min_gap_px)
     sections: list[Section] = []
-    current: list[Line] = [ordered[0]]
+    current: list[Line] = [lines[0]]
     gap_above: float | None = None
 
-    for i, line in enumerate(ordered[1:], start=1):
+    for i, line in enumerate(lines[1:], start=1):
         gap = stats.gaps[i - 1]
         if gap > stats.threshold:
             sections.append(_make_section(len(sections), current, gap_above, pad))
@@ -250,64 +243,6 @@ def _split_section_by_horizontal_lanes(section: Section, *, pad: float) -> list[
         return [section]
 
     return [_make_section(0, lane, section.gap_above, pad) for lane in lanes]
-
-
-def _split_section_by_word_x_clusters(section: Section, *, page_width: float, pad: float) -> list[Section]:
-    """Split a wide band when word x-centroids form two separated clusters (geometry only)."""
-    margin_x = page_width * 0.08
-    words = [
-        word
-        for line in section.lines
-        for word in line.words
-        if word.box.centroid_x >= margin_x
-    ]
-    if len(words) < 12:
-        return [section]
-
-    xs = [word.box.centroid_x for word in words]
-    centroids = [xs[len(xs) // 4], xs[(3 * len(xs)) // 4]]
-    for _ in range(24):
-        left_xs = [x for x in xs if abs(x - centroids[0]) <= abs(x - centroids[1])]
-        right_xs = [x for x in xs if abs(x - centroids[0]) > abs(x - centroids[1])]
-        if not left_xs or not right_xs:
-            return [section]
-        centroids = [sum(left_xs) / len(left_xs), sum(right_xs) / len(right_xs)]
-
-    separation = abs(centroids[1] - centroids[0])
-    min_sep = max(72.0, page_width * 0.08)
-    if separation < min_sep:
-        return [section]
-
-    split_x = (centroids[0] + centroids[1]) * 0.5
-    left_count = sum(1 for x in xs if x < split_x)
-    right_count = len(xs) - left_count
-    if min(left_count, right_count) / len(xs) < 0.18:
-        return [section]
-
-    left_lines: list[Line] = []
-    right_lines: list[Line] = []
-    line_index = 0
-    for line in section.lines:
-        left_words = [word for word in line.words if word.box.centroid_x < split_x]
-        right_words = [word for word in line.words if word.box.centroid_x >= split_x]
-        if left_words:
-            chunk = line_from_words(left_words, index=line_index)
-            if chunk is not None:
-                left_lines.append(chunk)
-                line_index += 1
-        if right_words:
-            chunk = line_from_words(right_words, index=line_index)
-            if chunk is not None:
-                right_lines.append(chunk)
-                line_index += 1
-
-    if len(left_lines) < 2 or len(right_lines) < 2:
-        return [section]
-
-    return [
-        _make_section(0, left_lines, section.gap_above, pad),
-        _make_section(1, right_lines, None, pad),
-    ]
 
 
 def split_prose_sections_by_lanes(sections: list[Section], *, pad: float) -> list[Section]:
@@ -510,272 +445,6 @@ def _flatten_words(lines: list[Line]) -> list[Word]:
     for ln in lines:
         out.extend(ln.words)
     return out
-
-
-def _orientation_spacing_threshold(
-    lines: list[Line],
-    *,
-    min_gap_px: float = 18.0,
-    gap_multiplier: float = 1.0,
-) -> float:
-    """Break threshold = average (median) horizontal word spacing on the page."""
-    ref = median_positive_word_gap_from_lines(lines)
-    return max(min_gap_px, ref * gap_multiplier)
-
-
-def _prepare_orientation_lines(
-    lines: list[Line],
-    fw: list[Line],
-    *,
-    min_gap_px: float = 18.0,
-    gap_multiplier: float = 1.0,
-    apply_spacing_peel: bool,
-) -> tuple[list[Line], list[Line], list[Line], list[Line], list[Line], float]:
-    """Split mixed rows; optionally peel vertical strips far from horizontal text."""
-    lines = split_lines_by_orientation_spacing(
-        lines, min_gap_px=min_gap_px, gap_multiplier=gap_multiplier
-    )
-    fw = split_lines_by_orientation_spacing(
-        fw, min_gap_px=min_gap_px, gap_multiplier=gap_multiplier
-    )
-    threshold = _orientation_spacing_threshold(
-        lines, min_gap_px=min_gap_px, gap_multiplier=gap_multiplier
-    )
-    isolated_vertical: list[Line] = []
-    if apply_spacing_peel:
-        body_lines, isolated_vertical = _partition_isolated_vertical_lines(
-            lines, min_gap_px=min_gap_px, gap_multiplier=gap_multiplier
-        )
-        fw_body, _ = _partition_isolated_vertical_lines(
-            fw, min_gap_px=min_gap_px, gap_multiplier=gap_multiplier
-        )
-        body_lines = _strip_isolated_vertical_words_from_lines(
-            body_lines, lines, threshold
-        )
-        fw_body = _strip_isolated_vertical_words_from_lines(fw_body, fw, threshold)
-    else:
-        body_lines, fw_body = lines, fw
-    return lines, fw, body_lines, fw_body, isolated_vertical, threshold
-
-
-def _line_is_isolated_vertical_strip(
-    line: Line,
-    pool: list[Line],
-    threshold: float,
-) -> bool:
-    """Vertical OCR row separated from horizontal neighbors by wide column gap."""
-    if not line_is_vertical(line):
-        return False
-    for other in pool:
-        if other is line or line_is_vertical(other):
-            continue
-        if not line.content_box.intersects_horizontally(other.content_box, slack=4.0):
-            continue
-        if column_gap_between_lines(line, other) < threshold:
-            return False
-    return True
-
-
-def _partition_isolated_vertical_lines(
-    lines: list[Line],
-    *,
-    min_gap_px: float = 18.0,
-    gap_multiplier: float = 1.0,
-) -> tuple[list[Line], list[Line]]:
-    threshold = _orientation_spacing_threshold(
-        lines, min_gap_px=min_gap_px, gap_multiplier=gap_multiplier
-    )
-    body: list[Line] = []
-    isolated: list[Line] = []
-    for ln in lines:
-        if _line_is_isolated_vertical_strip(ln, lines, threshold):
-            isolated.append(ln)
-        else:
-            body.append(ln)
-    return body, isolated
-
-
-def _word_is_isolated_vertical(
-    word: Word,
-    horizontal_lines: list[Line],
-    threshold: float,
-) -> bool:
-    if not word_is_vertical(word):
-        return False
-    wb = word.box
-    row_lines = [
-        ln
-        for ln in horizontal_lines
-        if ln.content_box.intersects_horizontally(wb, slack=4.0)
-    ]
-    if not row_lines:
-        return True
-    for ln in row_lines:
-        if wb.max_x <= ln.content_box.min_x:
-            gap = ln.content_box.min_x - wb.max_x
-        elif ln.content_box.max_x <= wb.min_x:
-            gap = wb.min_x - ln.content_box.max_x
-        else:
-            return False
-        if gap < threshold:
-            return False
-    return True
-
-
-def _strip_isolated_vertical_words_from_lines(
-    lines: list[Line],
-    pool: list[Line],
-    threshold: float,
-) -> list[Line]:
-    h_pool = [ln for ln in pool if not line_is_vertical(ln)]
-    out: list[Line] = []
-    idx = 0
-    for ln in lines:
-        if line_is_vertical(ln):
-            out.append(ln)
-            continue
-        kept = [
-            w
-            for w in ln.words
-            if not _word_is_isolated_vertical(w, h_pool, threshold)
-        ]
-        if not kept:
-            continue
-        if len(kept) == len(ln.words):
-            out.append(ln)
-            continue
-        chunk = line_from_words(kept, index=idx)
-        if chunk is not None:
-            out.append(chunk)
-            idx += 1
-    return out
-
-
-def _is_vertical_margin_word(word: Word, page_width: float) -> bool:
-    """Left-margin stamp word — narrow strip and near-vertical OCR orientation."""
-    if page_width <= 0:
-        return False
-    text = (word.text or "").strip()
-    if _STAMP_WORD.match(text) or text in {"-", "–", "—"}:
-        return False
-    margin_hi = page_width * 0.12
-    if word.box.max_x > margin_hi:
-        return False
-    if word.angle_deg is not None and is_vertical_angle(word.angle_deg):
-        return True
-    cb = word.box
-    aspect = cb.height / max(1.0, cb.width)
-    return aspect >= 1.2 and cb.max_x <= margin_hi
-
-
-def _is_margin_vertical_line(line: Line, page_width: float) -> bool:
-    """Narrow margin OCR from vertical stamps (arXiv sidebar, not diagonal watermarks)."""
-    if _is_column_watermark_line(line, page_width):
-        return False
-    if line.words:
-        v_count = sum(
-            1 for w in line.words if _is_vertical_margin_word(w, page_width)
-        )
-        if v_count >= max(1, len(line.words) * 0.5):
-            return True
-    cb = line.content_box
-    margin_hi = page_width * 0.065
-    if cb.min_x > margin_hi:
-        return False
-    if cb.max_x > max(margin_hi * 1.5, page_width * 0.10):
-        return False
-    aspect = cb.height / max(1.0, cb.width)
-    if aspect >= 1.0:
-        return True
-    text = (line.text or "").strip()
-    if len(line.words) == 1 and cb.width <= page_width * 0.05 and text:
-        if text in {"[", "]", ":"}:
-            return True
-    return False
-
-
-def _partition_margin_vertical_lines(
-    lines: list[Line],
-    page_width: float,
-) -> tuple[list[Line], list[Line]]:
-    body: list[Line] = []
-    margin: list[Line] = []
-    for ln in lines:
-        if _is_margin_vertical_line(ln, page_width):
-            margin.append(ln)
-        else:
-            body.append(ln)
-    return body, margin
-
-
-def _strip_margin_words_from_lines(
-    lines: list[Line],
-    page_width: float,
-) -> list[Line]:
-    """Drop margin-strip words merged into wide body lines by column splitting."""
-    from ocr_word_to_line_boxes import line_from_words
-
-    if page_width <= 0:
-        return lines
-    margin_hi = page_width * 0.14
-    out: list[Line] = []
-    idx = 0
-    for ln in lines:
-        kept = [
-            w
-            for w in ln.words
-            if w.box.max_x >= margin_hi and not _is_vertical_margin_word(w, page_width)
-        ]
-        if not kept:
-            continue
-        chunk = line_from_words(kept, index=idx)
-        if chunk is not None:
-            out.append(chunk)
-            idx += 1
-    return out
-
-
-def _cluster_margin_vertical_sections(
-    margin_lines: list[Line],
-    *,
-    pad: float,
-    max_join_gap_px: float = 100.0,
-) -> list[Section]:
-    """Cluster margin stamps; never bridge distant lines into one full-page bbox."""
-    if not margin_lines:
-        return []
-    ordered = sorted(
-        margin_lines, key=lambda ln: (ln.content_box.min_y, ln.content_box.min_x)
-    )
-    sections: list[Section] = []
-    current: list[Line] = [ordered[0]]
-    for line in ordered[1:]:
-        gap = line.content_box.min_y - current[-1].content_box.max_y
-        if gap > max_join_gap_px:
-            sections.append(_make_section(len(sections), current, None, pad))
-            current = [line]
-        else:
-            current.append(line)
-    if current:
-        sections.append(_make_section(len(sections), current, None, pad))
-    return sections
-
-
-def _attach_margin_vertical_sections(
-    sections: list[Section],
-    margin_lines: list[Line],
-    *,
-    pad: float,
-) -> list[Section]:
-    if not margin_lines:
-        return sections
-    margin_secs = _cluster_margin_vertical_sections(margin_lines, pad=pad)
-    merged = list(sections) + margin_secs
-    merged.sort(key=lambda s: min(ln.content_box.min_y for ln in s.lines))
-    return [
-        Section(i, sec.lines, sec.text, sec.box, sec.gap_above)
-        for i, sec in enumerate(merged)
-    ]
 
 
 def _cluster_gap_sections(
@@ -1297,7 +966,7 @@ def _layout_meta(
     return base
 
 
-def horizontal_gap_superboxes(
+def lines_to_sections_hv_combined(
     lines: list[Line],
     *,
     page_width: float,
@@ -1306,78 +975,39 @@ def horizontal_gap_superboxes(
     min_gap_px: float = 18.0,
     pad: float = 6.0,
 ) -> tuple[list[Section], GapStats, dict[str, Any]]:
-    """
-    Horizontal y-gap bands only — the first production superboxes before
-    per-band column peel (lines_to_sections_hv_combined step 1).
-    """
+    """Horizontal gap bands first; subdivide only bands that contain a valid aligned column."""
     fw = full_width_lines if full_width_lines is not None else lines
-    preview_sections, preview_stats = lines_to_sections(
+    gutter_x = estimate_page_gutter_x(fw, page_width)
+    v_partition = analyze_vertical_partition(fw, page_width)
+
+    h_sections, h_stats = lines_to_sections(
         fw, multiplier=multiplier, min_gap_px=min_gap_px, pad=pad
     )
-    preview_layouts = [classify_section_layout(sec.lines) for sec in preview_sections]
-    preview_line_counts = [len(sec.lines) for sec in preview_sections]
-    skip_vertical_for_table = table_layout_skips_vertical(
-        preview_line_counts,
-        preview_layouts,
-        all_lines=fw,
-        page_width=page_width,
-    )
-    _MEGA_FW_BAND_LINES = 15
-    has_mega_fw_section_table = any(
-        n >= _MEGA_FW_BAND_LINES
-        and lay.layout_kind in ("table", "section_table")
-        for n, lay in zip(preview_line_counts, preview_layouts)
-    )
-    use_body_sl_bands = False
-    body_preview_sections = preview_sections
-    body_preview_stats = preview_stats
-    if has_mega_fw_section_table:
-        body_preview_sections, body_preview_stats = lines_to_sections(
-            lines, multiplier=multiplier, min_gap_px=min_gap_px, pad=pad
-        )
-        use_body_sl_bands = len(body_preview_sections) > len(preview_sections)
-    band_source = lines if use_body_sl_bands else fw
-    if band_source is fw:
-        h_sections, h_stats = preview_sections, preview_stats
-    else:
-        h_sections, h_stats = body_preview_sections, body_preview_stats
-    if skip_vertical_for_table:
-        h_sections = _merge_page_top_stub(h_sections, pad=pad)
-        h_sections = _merge_page_bottom_stub(h_sections, pad=pad)
-    snap_meta: dict[str, Any] = {
-        "skip_vertical_for_table": skip_vertical_for_table,
-        "use_body_sl_bands": use_body_sl_bands,
-        "band_count": len(h_sections),
-        "band_source": "body_sl" if use_body_sl_bands else "full_width",
-    }
-    return h_sections, h_stats, snap_meta
-
-
-def apply_hv_column_peel(
-    h_sections: list[Section],
-    lines: list[Line],
-    *,
-    page_width: float,
-    full_width_lines: list[Line],
-    multiplier: float = 2.0,
-    min_gap_px: float = 18.0,
-    pad: float = 6.0,
-    gutter_x: float | None = None,
-    v_partition: Any | None = None,
-) -> tuple[list[Section], dict[str, Any]]:
-    """
-    L/R column peel on horizontal gap bands (step 3 of production pipeline).
-    Caller must skip when table_gate already handled superboxes in step 1.
-    """
-    fw = full_width_lines
-    if gutter_x is None:
-        gutter_x = estimate_page_gutter_x(fw, page_width)
-    if v_partition is None:
-        v_partition = analyze_vertical_partition(fw, page_width)
-
     band_layouts = [classify_section_layout(sec.lines) for sec in h_sections]
     band_line_counts = [len(sec.lines) for sec in h_sections]
     page_layout = page_layout_from_horizontal_bands(band_line_counts, band_layouts)
+    # Pure / table-dominant pages: keep horizontal bands only.
+    # Do NOT override this with a full-height amount column — that peels
+    # label|value grids (RISC itemization, invoices) into fake L/R sections.
+    # Vertical splits are for mixed section+table pages only (per-band below).
+    skip_vertical_for_table = table_layout_skips_vertical(
+        band_line_counts, band_layouts, all_lines=fw, page_width=page_width
+    )
+    if skip_vertical_for_table:
+        h_sections = _merge_page_top_stub(h_sections, pad=pad)
+        h_sections = _merge_page_bottom_stub(h_sections, pad=pad)
+        h_sections = split_prose_sections_by_lanes(h_sections, pad=pad)
+        return h_sections, h_stats, _layout_meta(
+            page_col=None,
+            gutter_x=gutter_x,
+            mode="gap",
+            page_layout=page_layout,
+            table_gate=True,
+            vertical_partition=v_partition.to_dict(),
+            horizontal_band_count=len(h_sections),
+            split_horizontal_indices=[],
+            section_roles=["horizontal"] * len(h_sections),
+        )
 
     page_col = detect_aligned_text_column(
         fw, page_width=page_width, gutter_x=gutter_x
@@ -1418,7 +1048,8 @@ def apply_hv_column_peel(
             layout="full_height_column",
             combine_merges=combine_merges,
         )
-        return sections, meta
+        stats = gap_stats(fw, multiplier=multiplier, min_gap_px=min_gap_px)
+        return sections, stats, meta
 
     merged: list[tuple[Section, str]] = []
     split_band_indices: list[int] = []
@@ -1480,7 +1111,7 @@ def apply_hv_column_peel(
 
     if not split_band_indices:
         h_sections = split_prose_sections_by_lanes(h_sections, pad=pad)
-        return h_sections, _layout_meta(
+        return h_sections, h_stats, _layout_meta(
             page_col=None,
             gutter_x=gutter_x,
             mode="gap",
@@ -1506,151 +1137,6 @@ def apply_hv_column_peel(
         section_roles=section_roles,
         vertical_partition=v_partition.to_dict(),
     )
-    return sections, meta
-
-
-def lines_to_sections_hv_combined(
-    lines: list[Line],
-    *,
-    page_width: float,
-    full_width_lines: list[Line] | None = None,
-    multiplier: float = 2.0,
-    min_gap_px: float = 18.0,
-    pad: float = 6.0,
-    apply_spacing_peel: bool = True,
-    spacing_gap_multiplier: float = 1.0,
-) -> tuple[list[Section], GapStats, dict[str, Any]]:
-    """Horizontal gap bands first; subdivide only bands that contain a valid aligned column."""
-    fw = full_width_lines if full_width_lines is not None else lines
-    _, _, body_lines, fw_body, isolated_vertical, _ = _prepare_orientation_lines(
-        lines,
-        fw,
-        min_gap_px=min_gap_px,
-        gap_multiplier=spacing_gap_multiplier,
-        apply_spacing_peel=apply_spacing_peel,
-    )
-
-    gutter_x = estimate_page_gutter_x(fw_body, page_width)
-    v_partition = analyze_vertical_partition(fw_body, page_width)
-
-    h_sections, h_stats, super_meta = horizontal_gap_superboxes(
-        body_lines,
-        page_width=page_width,
-        full_width_lines=fw_body,
-        multiplier=multiplier,
-        min_gap_px=min_gap_px,
-        pad=pad,
-    )
-    skip_vertical_for_table = bool(super_meta.get("skip_vertical_for_table"))
-    band_layouts = [classify_section_layout(sec.lines) for sec in h_sections]
-    band_line_counts = [len(sec.lines) for sec in h_sections]
-    page_layout = page_layout_from_horizontal_bands(band_line_counts, band_layouts)
-    if skip_vertical_for_table:
-        h_sections = split_prose_sections_by_lanes(h_sections, pad=pad)
-        if isolated_vertical:
-            h_sections = _attach_margin_vertical_sections(
-                h_sections, isolated_vertical, pad=pad
-            )
-        return h_sections, h_stats, _layout_meta(
-            page_col=None,
-            gutter_x=gutter_x,
-            mode="gap",
-            page_layout=page_layout,
-            table_gate=True,
-            vertical_partition=v_partition.to_dict(),
-            horizontal_band_count=len(h_sections),
-            split_horizontal_indices=[],
-            section_roles=["horizontal"] * len(h_sections),
-            gap_superboxes=super_meta,
-            isolated_vertical_line_count=len(isolated_vertical),
-            orientation_technique="spacing_peel",
-        )
-
-    sections, peel_meta = apply_hv_column_peel(
-        h_sections,
-        body_lines,
-        page_width=page_width,
-        full_width_lines=fw_body,
-        multiplier=multiplier,
-        min_gap_px=min_gap_px,
-        pad=pad,
-        gutter_x=gutter_x,
-        v_partition=v_partition,
-    )
-    if isolated_vertical:
-        sections = _attach_margin_vertical_sections(sections, isolated_vertical, pad=pad)
-    peel_meta["gap_superboxes"] = super_meta
-    peel_meta["isolated_vertical_line_count"] = len(isolated_vertical)
-    peel_meta["orientation_technique"] = "spacing_peel"
-    return sections, h_stats, peel_meta
-
-
-def lines_to_sections_dual_cluster(
-    lines: list[Line],
-    *,
-    page_width: float,
-    full_width_lines: list[Line] | None = None,
-    multiplier: float = 2.0,
-    min_gap_px: float = 18.0,
-    pad: float = 6.0,
-    spacing_gap_multiplier: float = 1.0,
-) -> tuple[list[Section], GapStats, dict[str, Any]]:
-    """
-    1) Cluster vertical-orientation lines into y-bands and redact them.
-    2) Cluster remaining horizontal lines into y-bands.
-    3) Merge both section lists by y.
-    """
-    fw = full_width_lines if full_width_lines is not None else lines
-    lines, fw, _, _, _, threshold = _prepare_orientation_lines(
-        lines,
-        fw,
-        min_gap_px=min_gap_px,
-        gap_multiplier=spacing_gap_multiplier,
-        apply_spacing_peel=False,
-    )
-
-    def _is_redacted_vertical(line: Line, pool: list[Line]) -> bool:
-        return line_is_vertical(line) and _line_is_isolated_vertical_strip(
-            line, pool, threshold
-        )
-
-    vertical_lines = [ln for ln in lines if _is_redacted_vertical(ln, lines)]
-    horizontal_lines = [ln for ln in lines if ln not in vertical_lines]
-    fw_horizontal = [ln for ln in fw if not _is_redacted_vertical(ln, fw)]
-
-    horizontal_lines = _strip_isolated_vertical_words_from_lines(
-        horizontal_lines, lines, threshold
-    )
-    fw_horizontal = _strip_isolated_vertical_words_from_lines(
-        fw_horizontal, fw, threshold
-    )
-
-    vertical_sections = _cluster_margin_vertical_sections(vertical_lines, pad=pad)
-
-    horizontal_sections, h_stats, meta = lines_to_sections_hv_combined(
-        horizontal_lines,
-        page_width=page_width,
-        full_width_lines=fw_horizontal,
-        multiplier=multiplier,
-        min_gap_px=min_gap_px,
-        pad=pad,
-        apply_spacing_peel=False,
-        spacing_gap_multiplier=spacing_gap_multiplier,
-    )
-
-    merged = list(horizontal_sections) + vertical_sections
-    merged.sort(key=lambda s: min(ln.content_box.min_y for ln in s.lines))
-    sections = [
-        Section(i, sec.lines, sec.text, sec.box, sec.gap_above)
-        for i, sec in enumerate(merged)
-    ]
-
-    meta = dict(meta)
-    meta["orientation_technique"] = "dual_cluster_redact"
-    meta["vertical_line_count"] = len(vertical_lines)
-    meta["horizontal_line_count"] = len(horizontal_lines)
-    meta["vertical_section_count"] = len(vertical_sections)
-    meta["horizontal_section_count"] = len(horizontal_sections)
     return sections, h_stats, meta
 
 

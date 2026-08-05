@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY vendor/mllm-scripts vendor/mllm-scripts
+COPY vendor/mllm-scripts-b2ad4c9 vendor/mllm-scripts-b2ad4c9
 COPY backend backend
 COPY demo_output demo_output
 
