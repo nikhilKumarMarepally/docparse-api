@@ -323,8 +323,8 @@ def list_user_emails_since(*, days: int = 2) -> list[dict[str, str]]:
             f"""
             SELECT DISTINCT email, created_at, last_login_at
             FROM {_TABLE}
-            WHERE datetime(created_at) >= datetime('now', ?)
-               OR datetime(last_login_at) >= datetime('now', ?)
+            WHERE replace(substr(created_at, 1, 19), 'T', ' ') >= datetime('now', ?)
+               OR replace(substr(last_login_at, 1, 19), 'T', ' ') >= datetime('now', ?)
             ORDER BY email COLLATE NOCASE
             """,
             (f"-{days} days", f"-{days} days"),
@@ -337,6 +337,13 @@ def list_user_emails_since(*, days: int = 2) -> list[dict[str, str]]:
         }
         for row in rows
     ]
+
+
+def count_users() -> int:
+    ensure_users_table()
+    with _connect() as conn:
+        row = conn.execute(f"SELECT COUNT(*) AS n FROM {_TABLE}").fetchone()
+    return int(row["n"]) if row else 0
 
 
 def users_db_status() -> dict[str, Any]:

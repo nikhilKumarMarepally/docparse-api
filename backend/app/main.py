@@ -32,7 +32,7 @@ from app.users_db import (
     insufficient_credits_for_pages,
     spend_credits_for_job,
 )
-from app.users_db import list_user_emails_since, users_db_status
+from app.users_db import count_users, list_user_emails_since, users_db_status
 
 _CRED_SOURCE = configure_web_env()
 logger = logging.getLogger(__name__)
@@ -159,7 +159,12 @@ def admin_recent_emails(
     if token != expected:
         raise HTTPException(status_code=403, detail="Forbidden")
     emails = list_user_emails_since(days=max(1, min(days, 30)))
-    return {"days": days, "count": len(emails), "emails": emails}
+    return {
+        "days": days,
+        "count": len(emails),
+        "total_users": count_users(),
+        "emails": emails,
+    }
 
 
 @app.get("/api/auth/config")
