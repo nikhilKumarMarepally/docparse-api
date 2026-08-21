@@ -38,11 +38,24 @@ _CRED_SOURCE = configure_web_env()
 logger = logging.getLogger(__name__)
 
 
+_DEFAULT_CORS_ORIGINS = [
+    "https://extracteverythiing.vercel.app",
+    "https://extracteverything.vercel.app",
+    "https://docparse-web.vercel.app",
+    "https://extractall.vercel.app",
+    "http://127.0.0.1:5173",
+]
+
+
 def _cors_origins() -> list[str]:
     raw = os.environ.get("CORS_ORIGINS", "*")
     if raw.strip() == "*":
         return ["*"]
-    return [o.strip() for o in raw.split(",") if o.strip()]
+    origins = [o.strip() for o in raw.split(",") if o.strip()]
+    for extra in _DEFAULT_CORS_ORIGINS:
+        if extra not in origins:
+            origins.append(extra)
+    return origins
 
 
 @asynccontextmanager

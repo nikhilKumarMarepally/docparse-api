@@ -665,10 +665,11 @@ def sections_from_opencv_boxes_direct(
     pad: float = SECTION_PAD,
 ) -> tuple[list[Section], dict[str, Any]]:
     """
-    Use OpenCV printed-frame bounds directly (>= min_confidence) as section boxes.
+    Snap section bounds to OpenCV printed frames (>= min_confidence) when those
+    frames cover the page. Uncovered lines stay in their original sections.
 
-    Lines are assigned to the box with the strongest word overlap; each non-empty
-    box becomes one section whose bounds match the OpenCV frame (+ pad).
+    Never dump leftover lines into one page-wide section — that drops the
+    prior boxes and hides text that already had a section.
     """
     hi_boxes = [b for b in boxes if b.confidence >= min_confidence]
     if not hi_boxes:
@@ -703,6 +704,19 @@ def sections_from_opencv_boxes_direct(
         else:
             unassigned.append(ln)
 
+    assigned_count = sum(len(group) for group in box_lines)
+    coverage = assigned_count / len(all_lines) if all_lines else 0.0
+    if coverage < COVERAGE_HYBRID_MIN:
+        return _reindex_sections(list(sections)), {
+            "mode": "opencv_direct",
+            "skipped": "low_coverage",
+            "min_confidence": min_confidence,
+            "opencv_box_count": len(hi_boxes),
+            "unassigned_lines": len(unassigned),
+            "line_coverage": round(coverage, 4),
+            "section_count": len(sections),
+        }
+
     out: list[Section] = []
     boxes_used = 0
     order = sorted(range(len(hi_boxes)), key=lambda i: (hi_boxes[i].y, hi_boxes[i].x))
@@ -723,9 +737,13 @@ def sections_from_opencv_boxes_direct(
             )
         )
 
-    if unassigned:
-        unassigned = sorted(unassigned, key=lambda ln: ln.content_box.min_y)
-        out.append(_make_section(len(out), unassigned, None, pad))
+    assigned_ids = {id(ln) for group in box_lines for ln in group}
+    for sec in sections:
+        leftover = [ln for ln in sec.lines if id(ln) not in assigned_ids]
+        if not leftover:
+            continue
+        leftover = sorted(leftover, key=lambda ln: ln.content_box.min_y)
+        out.append(_make_section(len(out), leftover, sec.gap_above, pad))
 
     meta: dict[str, Any] = {
         "mode": "opencv_direct",
@@ -733,6 +751,8 @@ def sections_from_opencv_boxes_direct(
         "opencv_box_count": len(hi_boxes),
         "sections_from_boxes": boxes_used,
         "unassigned_lines": len(unassigned),
+        "line_coverage": round(coverage, 4),
+        "overflow_policy": "keep_prior_sections",
         "section_count": len(out),
     }
     return _reindex_sections(out), meta
@@ -1009,6 +1029,22 @@ def _assemble_lr_gutter_sections(
         gutter_pad=gutter_pad,
     )
 
+    fitted = _fit_lr_gutter_boxes(
+        prose_box,
+        left_box,
+        right_box,
+        prose_lines=prose_lines,
+        left_lines=left_lines,
+        right_lines=right_lines,
+        page_width=page_width,
+        pad=pad,
+        gutter_x=gutter_x,
+        gutter_pad=gutter_pad,
+    )
+    if fitted is None:
+        return None
+    prose_box, left_box, right_box, prose_lines, left_lines, right_lines = fitted
+
     out: list[Section] = []
     if prose_lines and prose_box is not None:
         out.append(
@@ -1020,22 +1056,24 @@ def _assemble_lr_gutter_sections(
             )
         )
     gap_for_lr = sec.gap_above if not prose_lines else None
-    out.append(
-        _make_section_with_box(
-            len(out),
-            sorted(left_lines, key=lambda ln: ln.content_box.min_y),
-            gap_for_lr,
-            left_box,
+    if left_lines and left_box is not None:
+        out.append(
+            _make_section_with_box(
+                len(out),
+                sorted(left_lines, key=lambda ln: ln.content_box.min_y),
+                gap_for_lr,
+                left_box,
+            )
         )
-    )
-    out.append(
-        _make_section_with_box(
-            len(out),
-            sorted(right_lines, key=lambda ln: ln.content_box.min_y),
-            None,
-            right_box,
+    if right_lines and right_box is not None:
+        out.append(
+            _make_section_with_box(
+                len(out),
+                sorted(right_lines, key=lambda ln: ln.content_box.min_y),
+                None,
+                right_box,
+            )
         )
-    )
     return out if len(out) > 1 else None
 
 
@@ -1537,6 +1575,146 @@ def _boxes_overlap_y(a: Box, b: Box) -> bool:
 
 def _boxes_overlap_x(a: Box, b: Box) -> bool:
     return a.min_x < b.max_x and b.min_x < a.max_x
+
+
+def _box_covers_lines(box: Box, lines: list[Line], *, pad: float) -> bool:
+    """True when ``box`` fully contains every assigned word box (+ pad)."""
+    from ocr_line_to_sections import _bounds_covering_lines
+
+    if not lines:
+        return True
+    text_box = _bounds_covering_lines(lines, pad=pad)
+    eps = 0.5
+    return (
+        box.min_x <= text_box.min_x + eps
+        and box.min_y <= text_box.min_y + eps
+        and box.max_x >= text_box.max_x - eps
+        and box.max_y >= text_box.max_y - eps
+    )
+
+
+def _lr_column_box_usable(
+    box: Box | None,
+    lines: list[Line],
+    sibling_boxes: list[Box | None],
+    *,
+    pad: float,
+    gutter_x: float,
+    gutter_pad: float,
+    side: str,
+) -> Box | None:
+    """
+    Return a box that covers assigned text, or None when gutter clipping would cut glyphs.
+    """
+    from ocr_line_to_sections import _bounds_covering_lines
+
+    if box is None or not lines:
+        return box
+    if _box_covers_lines(box, lines, pad=pad):
+        return box
+
+    expanded = _bounds_covering_lines(lines, pad=pad)
+    for sib in sibling_boxes:
+        if sib is None:
+            continue
+        if _boxes_overlap_x(expanded, sib):
+            return None
+
+    if side == "left" and expanded.max_x > gutter_x - gutter_pad / 2:
+        if any(
+            sib is not None and sib.min_x < gutter_x + gutter_pad
+            for sib in sibling_boxes
+        ):
+            return None
+    if side == "right" and expanded.min_x < gutter_x + gutter_pad / 2:
+        if any(
+            sib is not None and sib.max_x > gutter_x - gutter_pad
+            for sib in sibling_boxes
+        ):
+            return None
+    return expanded
+
+
+def _fit_lr_gutter_boxes(
+    prose_box: Box | None,
+    left_box: Box | None,
+    right_box: Box | None,
+    *,
+    prose_lines: list[Line],
+    left_lines: list[Line],
+    right_lines: list[Line],
+    page_width: float,
+    pad: float,
+    gutter_x: float,
+    gutter_pad: float,
+) -> tuple[Box | None, Box | None, Box | None, list[Line], list[Line], list[Line]] | None:
+    """
+    Ensure L/R column boxes cover assigned text; drop columns that would cut glyphs.
+    Orphan lines from dropped columns merge into prose when possible.
+    """
+    left_box = _lr_column_box_usable(
+        left_box,
+        left_lines,
+        [right_box, prose_box],
+        pad=pad,
+        gutter_x=gutter_x,
+        gutter_pad=gutter_pad,
+        side="left",
+    )
+    right_box = _lr_column_box_usable(
+        right_box,
+        right_lines,
+        [left_box, prose_box],
+        pad=pad,
+        gutter_x=gutter_x,
+        gutter_pad=gutter_pad,
+        side="right",
+    )
+
+    orphan_left = left_box is None and bool(left_lines)
+    orphan_right = right_box is None and bool(right_lines)
+    if orphan_left and orphan_right:
+        return None
+
+    if orphan_left:
+        if prose_lines or prose_box is not None:
+            prose_lines = list(prose_lines) + left_lines
+            left_lines = []
+            prose_words = _body_words_from_lines(prose_lines, page_width)
+            prose_box = _box_from_words(
+                prose_words or _flatten_words(prose_lines),
+                pad=pad,
+            )
+            left_box = None
+        else:
+            return None
+
+    if orphan_right:
+        if prose_lines or prose_box is not None:
+            prose_lines = list(prose_lines) + right_lines
+            right_lines = []
+            prose_words = _body_words_from_lines(prose_lines, page_width)
+            prose_box = _box_from_words(
+                prose_words or _flatten_words(prose_lines),
+                pad=pad,
+            )
+            right_box = None
+        else:
+            return None
+
+    if left_box is None and right_box is None:
+        return None
+
+    if prose_lines and prose_box is not None and not _box_covers_lines(prose_box, prose_lines, pad=pad):
+        from ocr_line_to_sections import _bounds_covering_lines
+
+        prose_box = _bounds_covering_lines(prose_lines, pad=pad)
+
+    return prose_box, left_box, right_box, prose_lines, left_lines, right_lines
+
+
+def _flatten_words(lines: list[Line]) -> list[Word]:
+    return [w for ln in lines for w in ln.words]
 
 
 def _enforce_disjoint_section_boxes(
@@ -2063,12 +2241,76 @@ def _x_gap_baseline_multiplier() -> float:
 
 def _is_data_table_section(sec: Section, page_width: float) -> bool:
     """Row-coupled label|value grids and high-confidence data tables — not figure pairs."""
-    from section_table_layout import classify_section_layout
+    from section_table_layout import classify_section_layout, _layout_is_table_family
 
     if _is_row_coupled_lr_table_band(sec.lines, page_width):
         return True
     lay = classify_section_layout(sec.lines)
-    return lay.layout_kind == "table" and lay.confidence >= 0.72
+    if not _layout_is_table_family(lay) or lay.confidence < 0.72:
+        return False
+    if lay.layout_kind == "table":
+        return True
+    return lay.aligned_column_count >= 4
+
+
+def _section_blocks_x_gap_split(sec: Section, page_width: float) -> bool:
+    """Skip x-gap peel on multi-column grids and unified row-coupled tables."""
+    from section_table_layout import analyze_vertical_partition, classify_section_layout, _layout_is_table_family
+
+    if _is_row_coupled_lr_table_band(sec.lines, page_width):
+        return True
+
+    lay = classify_section_layout(sec.lines)
+    if _layout_is_table_family(lay) and lay.confidence >= 0.72:
+        if lay.layout_kind == "table":
+            return True
+        if lay.aligned_column_count >= 4:
+            return True
+
+    part = analyze_vertical_partition(sec.lines, page_width)
+    if part.has_column and part.is_unified_grid:
+        return True
+
+    return False
+
+
+def _lr_gutter_split_is_valid(
+    parts: list[Section],
+    parent: Section,
+    *,
+    page_width: float,
+    pad: float,
+) -> bool:
+    """
+    Reject L/R parts that would leave narrow column shards or cut assigned text.
+    """
+    del page_width  # reserved for future page-relative thresholds
+    if len(parts) <= 1:
+        return True
+
+    parent_w = max(parent.box.width, 1.0)
+    min_panel_w = max(parent_w * 0.20, 72.0)
+
+    for part in parts:
+        if not part.lines:
+            continue
+        if not _box_covers_lines(part.box, part.lines, pad=pad):
+            return False
+
+        for ln in part.lines:
+            for w in ln.words:
+                if (
+                    w.box.min_x < part.box.min_x - 0.5
+                    or w.box.max_x > part.box.max_x + 0.5
+                    or w.box.min_y < part.box.min_y - 0.5
+                    or w.box.max_y > part.box.max_y + 0.5
+                ):
+                    return False
+
+        if part.box.width < min_panel_w:
+            return False
+
+    return True
 
 
 def _prose_chart_split_is_valid(parts: list[Section], page_width: float) -> bool:
@@ -2139,7 +2381,7 @@ def split_sections_by_horizontal_x_gaps(
             out.append(sec)
             continue
 
-        if _is_data_table_section(sec, page_width):
+        if _section_blocks_x_gap_split(sec, page_width):
             out.append(sec)
             continue
 
@@ -2154,7 +2396,12 @@ def split_sections_by_horizontal_x_gaps(
             pad=pad,
             min_lr_gap=min_lr_gap,
         )
-        if len(parts) > 1:
+        if len(parts) > 1 and _lr_gutter_split_is_valid(
+            parts,
+            sec,
+            page_width=page_width,
+            pad=pad,
+        ):
             split_count += 1
             out.extend(parts)
         else:

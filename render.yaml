@@ -22,7 +22,7 @@ services:
       - key: DOC_EXTRACT_CRED_MODE
         value: personal_only
       - key: CORS_ORIGINS
-        value: https://extracteverythiing.vercel.app,https://docparse-web.vercel.app,https://extractall.vercel.app,http://127.0.0.1:5173
+        value: https://extracteverythiing.vercel.app,https://extracteverything.vercel.app,https://docparse-web.vercel.app,https://extractall.vercel.app,http://127.0.0.1:5173
       - key: DOC_EXTRACT_AUTH_REQUIRED
         value: "true"
       - key: GEMINI_API_KEY

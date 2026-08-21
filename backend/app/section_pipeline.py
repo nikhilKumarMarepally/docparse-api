@@ -25,7 +25,6 @@ class SectionPipelineHandler:
     | 1 | B2ad4c9SectioningStep | step1_b2ad4c9 |
     | 2 | VerticalTableMergeStep | step2_table_merge |
     | 3 | HorizontalXGapSplitStep | step3_x_gap_split |
-    | 4 | OpenCvHorizontalBoxSplitStep | step4_opencv_split |
     """
 
     def __init__(
@@ -36,10 +35,9 @@ class SectionPipelineHandler:
         self.ctx = ctx
         self._custom_steps = steps
 
-    def run(self, *, include_optional: bool = True) -> PageSectionContext:
+    def run(self) -> PageSectionContext:
         ctx = self.ctx
-        ctx.include_optional = include_optional
-        steps = self._custom_steps or pipeline_steps(include_optional=include_optional)
+        steps = self._custom_steps or pipeline_steps()
         if not ctx.section_meta:
             ctx.section_meta = {
                 "unified_pipeline": True,
@@ -55,10 +53,7 @@ class SectionPipelineHandler:
     def _finalize_mode(self, ctx: PageSectionContext) -> None:
         mode = ctx.column_meta.get("mode", "horizontal_gap")
         step3 = ctx.section_meta.get("step3_x_gap_split") or {}
-        step4 = ctx.section_meta.get("step4_opencv_split") or {}
-        if int(step4.get("split_section_count", 0)) > 0:
-            mode = f"{mode}_opencv_split"
-        elif int(step3.get("x_gap_split_section_count", 0)) > 0:
+        if int(step3.get("x_gap_split_section_count", 0)) > 0:
             mode = f"{mode}_x_gap_split"
         if ctx.merge_count:
             mode = f"{mode}_table_merge"
@@ -79,7 +74,6 @@ def run_page_section_pipeline(
     page_width: float,
     page_rgb: Image.Image,
     record_snapshots: bool = False,
-    include_optional: bool = True,
 ) -> PageSectionContext:
     ctx = PageSectionContext(
         vision=vision,
@@ -87,9 +81,8 @@ def run_page_section_pipeline(
         page_width=page_width,
         page_rgb=page_rgb,
         record_snapshots=record_snapshots,
-        include_optional=include_optional,
     )
-    return SectionPipelineHandler(ctx).run(include_optional=include_optional)
+    return SectionPipelineHandler(ctx).run()
 
 
 def render_production_sections(

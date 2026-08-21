@@ -75,7 +75,6 @@ def build_page_sections_snapshots(
         page_width=page_width,
         page_rgb=page_rgb,
         record_snapshots=True,
-        include_optional=True,
     )
     snapshots = list(ctx.snapshots)
     drop_dicts = _sections_objs_to_dicts(ctx.sections)
@@ -85,7 +84,7 @@ def build_page_sections_snapshots(
         page_width=float(page_width),
     )
     snapshots.append(("drop_contained", drop_dicts))
-    return snapshots, ctx.section_meta, ctx.fw_lines, list(ctx.opencv_boxes)
+    return snapshots, ctx.section_meta, ctx.fw_lines
 
 
 def build_page_sections(
@@ -104,7 +103,6 @@ def build_page_sections(
         page_width=page_width,
         page_rgb=page_rgb,
         record_snapshots=False,
-        include_optional=True,
     )
     return ctx.sections, ctx.section_meta, ctx.fw_lines
 
@@ -345,10 +343,18 @@ def draw_filter_overlay(
     img_w, img_h = img.size
     for section in sections:
         bounds = section.get("bounds") or {}
-        x0 = max(0, min(int(bounds.get("min_x", 0)), img_w - 1))
-        y0 = max(0, min(int(bounds.get("min_y", 0)), img_h - 1))
-        x1 = max(x0, min(int(bounds.get("max_x", 0)), img_w))
-        y1 = max(y0, min(int(bounds.get("max_y", 0)), img_h))
+        x0 = int(bounds.get("min_x", 0))
+        y0 = int(bounds.get("min_y", 0))
+        x1 = int(bounds.get("max_x", 0))
+        y1 = int(bounds.get("max_y", 0))
+        if x1 < x0:
+            x0, x1 = x1, x0
+        if y1 < y0:
+            y0, y1 = y1, y0
+        x0 = max(0, min(x0, img_w - 1))
+        y0 = max(0, min(y0, img_h - 1))
+        x1 = max(x0, min(x1, img_w))
+        y1 = max(y0, min(y1, img_h))
         prep = section.get("preprocess") or {}
         gate = section.get("content_gate") or {}
         if overlay_mode == "gate" and gate:

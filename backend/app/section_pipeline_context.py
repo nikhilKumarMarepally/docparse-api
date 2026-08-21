@@ -104,7 +104,6 @@ class PageSectionContext:
     page_width: float
     page_rgb: Image.Image
     record_snapshots: bool = False
-    include_optional: bool = True
     fw_lines: list[Any] = field(default_factory=list)
     split_lines: list[Any] = field(default_factory=list)
     body_sl: list[Any] = field(default_factory=list)
@@ -112,7 +111,6 @@ class PageSectionContext:
     sections: list[Section] = field(default_factory=list)
     section_meta: dict[str, Any] = field(default_factory=dict)
     line_pool: dict[int, Any] = field(default_factory=dict)
-    opencv_boxes: list[Any] = field(default_factory=list)
     gap_stats_obj: Any = None
     column_meta: dict[str, Any] = field(default_factory=dict)
     skip_vertical_for_table: bool = False

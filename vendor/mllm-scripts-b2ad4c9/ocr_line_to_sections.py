@@ -978,7 +978,8 @@ def lines_to_sections_hv_combined(
     """Horizontal gap bands first; subdivide only bands that contain a valid aligned column."""
     fw = full_width_lines if full_width_lines is not None else lines
     gutter_x = estimate_page_gutter_x(fw, page_width)
-    v_partition = analyze_vertical_partition(fw, page_width)
+    # TEMP: disabled with vertical section detection (restore for production hv_combined).
+    # v_partition = analyze_vertical_partition(fw, page_width)
 
     h_sections, h_stats = lines_to_sections(
         fw, multiplier=multiplier, min_gap_px=min_gap_px, pad=pad
@@ -1003,141 +1004,160 @@ def lines_to_sections_hv_combined(
             mode="gap",
             page_layout=page_layout,
             table_gate=True,
-            vertical_partition=v_partition.to_dict(),
+            vertical_partition={},
             horizontal_band_count=len(h_sections),
             split_horizontal_indices=[],
             section_roles=["horizontal"] * len(h_sections),
         )
 
-    page_col = detect_aligned_text_column(
-        fw, page_width=page_width, gutter_x=gutter_x
-    )
-    page_col_ref = (
-        page_col
-        if page_col is not None and aligned_column_valid_for_vertical(fw, page_col)
-        else None
-    )
-
-    # Full-height column peel is for multi-section pages, not a lone table grid.
-    if (
-        page_col_ref is not None
-        and _is_full_height_column(page_col_ref, fw)
-        and page_layout != "table"
-    ):
-        merged_secs, section_roles, combine_merges = _lines_to_sections_hv_full_column(
-            lines,
-            page_col_ref,
-            page_width=page_width,
-            gutter_x=gutter_x,
-            multiplier=multiplier,
-            min_gap_px=min_gap_px,
-            pad=pad,
-        )
-        sections = [
-            Section(idx, s.lines, s.text, s.box, s.gap_above)
-            for idx, s in enumerate(merged_secs)
-        ]
-        sections = split_prose_sections_by_lanes(sections, pad=pad)
-        meta = _layout_meta(
-            page_col=page_col_ref,
-            gutter_x=gutter_x,
-            mode="hv_combined",
-            horizontal_band_count=0,
-            split_horizontal_indices=[],
-            section_roles=section_roles,
-            layout="full_height_column",
-            combine_merges=combine_merges,
-        )
-        stats = gap_stats(fw, multiplier=multiplier, min_gap_px=min_gap_px)
-        return sections, stats, meta
-
-    merged: list[tuple[Section, str]] = []
-    split_band_indices: list[int] = []
-    band_col_ref: Any | None = None
-
-    for i, band_sec in enumerate(h_sections):
-        if band_skips_vertical_column_split(
-            band_layouts[i], band_lines=band_sec.lines, page_width=page_width
-        ):
-            merged.append((band_sec, "horizontal"))
-            continue
-        band_y0, band_y1 = _section_line_y_span(band_sec)
-        band_col = detect_aligned_text_column(
-            band_sec.lines,
-            page_width=page_width,
-            gutter_x=gutter_x,
-            y_min=band_y0,
-            y_max=band_y1,
-        )
-        if band_col is None:
-            merged.append((band_sec, "horizontal"))
-            continue
-        if _band_column_overlap_frac(band_y0, band_y1, band_col) < 0.22:
-            merged.append((band_sec, "horizontal"))
-            continue
-        if page_col_ref is not None and abs(
-            band_col.anchor_min_x - page_col_ref.anchor_min_x
-        ) > 90:
-            merged.append((band_sec, "horizontal"))
-            continue
-        if not _column_split_safe(band_sec.lines, band_col):
-            merged.append((band_sec, "horizontal"))
-            continue
-        if _band_lines_are_wide_label_value_rows(
-            band_sec.lines,
-            page_width=page_width,
-            split_x=band_col.split_x,
-        ) and not analyze_vertical_partition(
-            band_sec.lines, page_width
-        ).allows_column_split():
-            merged.append((band_sec, "horizontal"))
-            continue
-
-        split_secs, roles = _split_horizontal_band_at_column(
-            band_sec,
-            band_col,
-            page_width=page_width,
-            gutter_x=gutter_x,
-            multiplier=multiplier,
-            min_gap_px=min_gap_px,
-            pad=pad,
-        )
-        if not split_secs:
-            merged.append((band_sec, "horizontal"))
-            continue
-        split_band_indices.append(i)
-        band_col_ref = band_col
-        merged.extend(zip(split_secs, roles))
-
-    if not split_band_indices:
-        h_sections = split_prose_sections_by_lanes(h_sections, pad=pad)
-        return h_sections, h_stats, _layout_meta(
-            page_col=None,
-            gutter_x=gutter_x,
-            mode="gap",
-            horizontal_band_count=len(h_sections),
-            split_horizontal_indices=[],
-            section_roles=["horizontal"] * len(h_sections),
-        )
-
-    merged.sort(key=lambda t: min(ln.content_box.min_y for ln in t[0].lines))
-    section_roles = [role for _, role in merged]
-    sections = [
-        Section(idx, sec.lines, sec.text, sec.box, sec.gap_above)
-        for idx, (sec, _) in enumerate(merged)
-    ]
-    sections = split_prose_sections_by_lanes(sections, pad=pad)
-
-    meta = _layout_meta(
-        page_col=page_col_ref or band_col_ref,
+    # TEMP: vertical section detection disabled — skip aligned-column peel and
+    # per-band L/R splits; horizontal gap bands only. Restore DISABLED block below
+    # to match production b2ad4c9 hv_combined (e.g. RISC S3/S4 column peel).
+    h_sections = _merge_page_top_stub(h_sections, pad=pad)
+    h_sections = _merge_page_bottom_stub(h_sections, pad=pad)
+    h_sections = split_prose_sections_by_lanes(h_sections, pad=pad)
+    return h_sections, h_stats, _layout_meta(
+        page_col=None,
         gutter_x=gutter_x,
-        mode="hv_combined",
+        mode="gap",
+        page_layout=page_layout,
+        vertical_disabled=True,
         horizontal_band_count=len(h_sections),
-        split_horizontal_indices=split_band_indices,
-        section_roles=section_roles,
-        vertical_partition=v_partition.to_dict(),
+        split_horizontal_indices=[],
+        section_roles=["horizontal"] * len(h_sections),
     )
-    return sections, h_stats, meta
+
+    # --- vertical section detection (DISABLED — uncomment block to restore) ---
+    # page_col = detect_aligned_text_column(
+    #     fw, page_width=page_width, gutter_x=gutter_x
+    # )
+    # page_col_ref = (
+    #     page_col
+    #     if page_col is not None and aligned_column_valid_for_vertical(fw, page_col)
+    #     else None
+    # )
+    #
+    # # Full-height column peel is for multi-section pages, not a lone table grid.
+    # if (
+    #     page_col_ref is not None
+    #     and _is_full_height_column(page_col_ref, fw)
+    #     and page_layout != "table"
+    # ):
+    #     merged_secs, section_roles, combine_merges = _lines_to_sections_hv_full_column(
+    #         lines,
+    #         page_col_ref,
+    #         page_width=page_width,
+    #         gutter_x=gutter_x,
+    #         multiplier=multiplier,
+    #         min_gap_px=min_gap_px,
+    #         pad=pad,
+    #     )
+    #     sections = [
+    #         Section(idx, s.lines, s.text, s.box, s.gap_above)
+    #         for idx, s in enumerate(merged_secs)
+    #     ]
+    #     sections = split_prose_sections_by_lanes(sections, pad=pad)
+    #     meta = _layout_meta(
+    #         page_col=page_col_ref,
+    #         gutter_x=gutter_x,
+    #         mode="hv_combined",
+    #         horizontal_band_count=0,
+    #         split_horizontal_indices=[],
+    #         section_roles=section_roles,
+    #         layout="full_height_column",
+    #         combine_merges=combine_merges,
+    #     )
+    #     stats = gap_stats(fw, multiplier=multiplier, min_gap_px=min_gap_px)
+    #     return sections, stats, meta
+    #
+    # merged: list[tuple[Section, str]] = []
+    # split_band_indices: list[int] = []
+    # band_col_ref: Any | None = None
+    #
+    # for i, band_sec in enumerate(h_sections):
+    #     if band_skips_vertical_column_split(
+    #         band_layouts[i], band_lines=band_sec.lines, page_width=page_width
+    #     ):
+    #         merged.append((band_sec, "horizontal"))
+    #         continue
+    #     band_y0, band_y1 = _section_line_y_span(band_sec)
+    #     band_col = detect_aligned_text_column(
+    #         band_sec.lines,
+    #         page_width=page_width,
+    #         gutter_x=gutter_x,
+    #         y_min=band_y0,
+    #         y_max=band_y1,
+    #     )
+    #     if band_col is None:
+    #         merged.append((band_sec, "horizontal"))
+    #         continue
+    #     if _band_column_overlap_frac(band_y0, band_y1, band_col) < 0.22:
+    #         merged.append((band_sec, "horizontal"))
+    #         continue
+    #     if page_col_ref is not None and abs(
+    #         band_col.anchor_min_x - page_col_ref.anchor_min_x
+    #     ) > 90:
+    #         merged.append((band_sec, "horizontal"))
+    #         continue
+    #     if not _column_split_safe(band_sec.lines, band_col):
+    #         merged.append((band_sec, "horizontal"))
+    #         continue
+    #     if _band_lines_are_wide_label_value_rows(
+    #         band_sec.lines,
+    #         page_width=page_width,
+    #         split_x=band_col.split_x,
+    #     ) and not analyze_vertical_partition(
+    #         band_sec.lines, page_width
+    #     ).allows_column_split():
+    #         merged.append((band_sec, "horizontal"))
+    #         continue
+    #
+    #     split_secs, roles = _split_horizontal_band_at_column(
+    #         band_sec,
+    #         band_col,
+    #         page_width=page_width,
+    #         gutter_x=gutter_x,
+    #         multiplier=multiplier,
+    #         min_gap_px=min_gap_px,
+    #         pad=pad,
+    #     )
+    #     if not split_secs:
+    #         merged.append((band_sec, "horizontal"))
+    #         continue
+    #     split_band_indices.append(i)
+    #     band_col_ref = band_col
+    #     merged.extend(zip(split_secs, roles))
+    #
+    # if not split_band_indices:
+    #     h_sections = split_prose_sections_by_lanes(h_sections, pad=pad)
+    #     return h_sections, h_stats, _layout_meta(
+    #         page_col=None,
+    #         gutter_x=gutter_x,
+    #         mode="gap",
+    #         horizontal_band_count=len(h_sections),
+    #         split_horizontal_indices=[],
+    #         section_roles=["horizontal"] * len(h_sections),
+    #     )
+    #
+    # merged.sort(key=lambda t: min(ln.content_box.min_y for ln in t[0].lines))
+    # section_roles = [role for _, role in merged]
+    # sections = [
+    #     Section(idx, sec.lines, sec.text, sec.box, sec.gap_above)
+    #     for idx, (sec, _) in enumerate(merged)
+    # ]
+    # sections = split_prose_sections_by_lanes(sections, pad=pad)
+    #
+    # v_partition = analyze_vertical_partition(fw, page_width)
+    # meta = _layout_meta(
+    #     page_col=page_col_ref or band_col_ref,
+    #     gutter_x=gutter_x,
+    #     mode="hv_combined",
+    #     horizontal_band_count=len(h_sections),
+    #     split_horizontal_indices=split_band_indices,
+    #     section_roles=section_roles,
+    #     vertical_partition=v_partition.to_dict(),
+    # )
+    # return sections, h_stats, meta
 
 
 def lines_to_sections_vertical_only(
