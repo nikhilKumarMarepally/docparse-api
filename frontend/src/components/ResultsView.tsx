@@ -172,9 +172,9 @@ export default function ResultsView({ job, onNewDoc, onCopyJson, onDownloadJson 
 
   const tabs: { id: Tab; label: string }[] = [
     { id: "sections", label: "By region" },
-    { id: "yolo", label: "YOLO Sections" },
     { id: "kv", label: "Key value" },
     { id: "tables", label: "Tables" },
+    { id: "yolo", label: "YOLO Bounds" },
     { id: "json", label: "JSON" },
   ];
 
