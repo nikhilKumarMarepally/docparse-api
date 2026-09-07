@@ -35,6 +35,9 @@ from ocr_word_to_line_boxes import load_words  # noqa: E402
 from section_preprocess import annotate_preprocess  # noqa: E402
 from section_table_layout import classify_section_layout  # noqa: E402
 
+PRODUCTION_FILTER_OVERLAY_TITLE = (
+    "Sections — green preprocess kept / red filtered (all sections extracted)"
+)
 
 def _section_label(text: str, index: int) -> str:
     norm = re.sub(r"\s+", " ", (text or "").strip().lower())[:80]
@@ -608,7 +611,7 @@ def process_page(
         page_png,
         annotated,
         overlay_path,
-        overlay_title="Sections — green preprocess kept / red filtered (all sections extracted)",
+        overlay_title=PRODUCTION_FILTER_OVERLAY_TITLE,
         overlay_mode="preprocess",
     )
 

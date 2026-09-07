@@ -394,17 +394,49 @@ def _continues_table_columns(
         return True
 
     right_stats = _column_grid_stats(right_words)
-    if right_stats and _has_repeated_column_grid(right_stats):
-        right_dom = _dominant_column_mids(right_stats, min_rows=2)
-        shared = sum(
-            1
-            for left_mid in dominant
-            for right_mid in right_dom
-            if abs(left_mid - right_mid) <= tolerance
-        )
-        if shared >= 2:
-            return True
-    return False
+    return _column_grids_share_anchors(left_stats, right_stats)
+
+
+def _column_grids_share_anchors(
+    left_stats: ColumnGridStats | None,
+    right_stats: ColumnGridStats | None,
+    *,
+    min_shared: int = 2,
+    min_hits: int = 2,
+) -> bool:
+    """True when stacked bands reuse the same column x-anchors (continuation, not two grids)."""
+    if left_stats is None or right_stats is None:
+        return False
+    left_dom = [
+        mid
+        for mid, hits in zip(left_stats.col_mids, left_stats.row_hits)
+        if hits >= min_hits
+    ]
+    right_dom = [
+        mid
+        for mid, hits in zip(right_stats.col_mids, right_stats.row_hits)
+        if hits >= min_hits
+    ]
+    if len(left_dom) < min_shared or len(right_dom) < min_shared:
+        return False
+    tolerance = max(left_stats.x_tolerance, right_stats.x_tolerance)
+    used: set[int] = set()
+    shared = 0
+    for left_mid in left_dom:
+        best_j: int | None = None
+        best_d: float | None = None
+        for j, right_mid in enumerate(right_dom):
+            if j in used:
+                continue
+            dist = abs(left_mid - right_mid)
+            if dist <= tolerance and (best_d is None or dist < best_d):
+                best_d = dist
+                best_j = j
+        if best_j is not None:
+            used.add(best_j)
+            shared += 1
+    smaller = min(len(left_dom), len(right_dom))
+    return shared >= min_shared and shared >= smaller
 
 
 def _rows_share_column_starts(
@@ -806,7 +838,12 @@ def should_merge_table_fragments(
 
     left_kind = _layout_kind_from_section(left)
     right_kind = _layout_kind_from_section(right)
-    if left_kind == "prose" and right_kind == "prose":
+    left_struct = _words_structurally_table(left_words, page_width)
+    right_struct = _words_structurally_table(right_words, page_width)
+    share_grid = _column_grids_share_anchors(left_stats, right_stats)
+    if left_kind == "prose" and right_kind == "prose" and not (
+        left_struct or right_struct or share_grid
+    ):
         if not (
             _prose_section_continues_table_rows(
                 left_words, right_words, page_width, x_tol=x_tol_early
@@ -830,7 +867,12 @@ def should_merge_table_fragments(
         and right_kind in ("table", "section_table")
     ):
         return False
-    left_is_table = bool(left.get("table_band")) or _has_repeated_column_grid(left_stats)
+    left_is_table = (
+        bool(left.get("table_band"))
+        or _has_repeated_column_grid(left_stats)
+        or left_kind in ("table", "section_table")
+        or left_struct
+    )
 
     if _section_is_parallel_lr_block(right, lines, page_width):
         return False
@@ -867,7 +909,7 @@ def should_merge_table_fragments(
     x_tol = right_stats.x_tolerance if right_stats else max(12.0, gap_threshold)
 
     if gap > _median_row_gap(left_words) * 1.35:
-        if not (
+        if not share_grid and not (
             _has_repeated_column_grid(left_stats)
             and _has_repeated_column_grid(right_stats)
         ):
@@ -883,9 +925,12 @@ def should_merge_table_fragments(
 
     if left_is_table:
         row_gap = _median_row_gap(left_words)
-        if row_gap > 0 and gap > row_gap * 1.65:
+        grid_continues = share_grid or _continues_table_columns(
+            left_words, right_words, tolerance=x_tol
+        )
+        if row_gap > 0 and gap > row_gap * 1.65 and not grid_continues:
             return False
-        if not _stacked_vertical_table_continuity(
+        if not grid_continues and not _stacked_vertical_table_continuity(
             left_words, right_words, page_width, tolerance=x_tol
         ):
             return False

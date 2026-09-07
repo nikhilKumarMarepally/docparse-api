@@ -5,11 +5,12 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from app.jobs import create_job, get_job, job_file_path
+from app.yolo_sections import detect_sections_from_image_bytes, detect_sections_from_job
 from app.paths import JOB_ROOT, TOOL_ROOT, configure_web_env, is_cloud_deploy
 from app.auth import (
     auth_required,
@@ -415,6 +416,107 @@ def page_overlay(job_id: str, page_index: int) -> FileResponse:
     if not path.exists():
         raise HTTPException(status_code=404, detail="Overlay not found")
     return FileResponse(path, media_type="image/png")
+
+
+def _load_job_result(job_id: str) -> dict:
+    job = get_job(job_id)
+    if job is not None and job.result is not None:
+        return job.result
+    result_path = JOB_ROOT / job_id / "result.json"
+    if result_path.exists():
+        import json
+
+        return json.loads(result_path.read_text())
+    raise HTTPException(status_code=404, detail="Job not found")
+
+
+def _page_source_path(job_id: str, page_index: int) -> Path:
+    candidates = [
+        f"pages/page_{page_index:03d}.png",
+        f"pages/raw/page_{page_index:03d}.png",
+        f"page_{page_index:03d}/page.png",
+    ]
+    for rel in candidates:
+        path = job_file_path(job_id, rel)
+        if path is None:
+            path = JOB_ROOT / job_id / rel
+        if path.exists():
+            return path
+    raise HTTPException(status_code=404, detail="Page image not found")
+
+
+@app.get("/api/jobs/{job_id}/pages/{page_index}/yolo_bounds")
+def page_yolo_bounds(job_id: str, page_index: int) -> dict:
+    """Export production section bounds in YOLO-compatible JSON (no ML model)."""
+    from PIL import Image
+
+    result = _load_job_result(job_id)
+    pages = result.get("pages") or []
+    page = next((p for p in pages if int(p.get("page_index", -1)) == page_index), None)
+    if page is None:
+        raise HTTPException(status_code=404, detail="Page not found")
+
+    source_path = _page_source_path(job_id, page_index)
+    with Image.open(source_path) as img:
+        image_width, image_height = img.size
+
+    sections = page.get("sections") or []
+    return detect_sections_from_job(
+        job_id=job_id,
+        page_index=page_index,
+        sections=sections,
+        image_width=image_width,
+        image_height=image_height,
+    )
+
+
+@app.post("/api/yolo/sections")
+async def yolo_sections(
+    file: UploadFile | None = File(None),
+    job_id: str | None = Form(None),
+    page_index: int | None = Form(None),
+) -> dict:
+    """
+    Return section bounds in YOLO-compatible JSON.
+
+    Provide either an uploaded page image (``file``) or ``job_id`` + ``page_index``
+    to reuse production pipeline bounds from a completed job.
+    """
+    if file is not None and file.filename:
+        suffix = Path(file.filename).suffix.lower()
+        if suffix not in ALLOWED_SUFFIXES:
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {suffix}")
+        data = await file.read()
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=400, detail="File exceeds 20 MB limit")
+        return detect_sections_from_image_bytes(data)
+
+    if job_id and page_index is not None:
+        from PIL import Image
+
+        result = _load_job_result(job_id)
+        pages = result.get("pages") or []
+        page = next((p for p in pages if int(p.get("page_index", -1)) == page_index), None)
+        if page is None:
+            raise HTTPException(status_code=404, detail="Page not found")
+
+        source_path = _page_source_path(job_id, page_index)
+        with Image.open(source_path) as img:
+            image_width, image_height = img.size
+
+        sections = page.get("sections") or []
+        return detect_sections_from_job(
+            job_id=job_id,
+            page_index=page_index,
+            sections=sections,
+            image_width=image_width,
+            image_height=image_height,
+        )
+
+    raise HTTPException(
+        status_code=400,
+        detail="Provide either file upload or job_id and page_index",
+    )
 
 
 @app.get("/api/jobs/{job_id}/pages/{page_index}/sections/{section_index}/crop.png")

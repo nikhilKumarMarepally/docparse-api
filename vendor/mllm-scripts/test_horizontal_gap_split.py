@@ -20,6 +20,8 @@ from ocr_line_to_sections import (
     _strip_margin_words_from_lines,
     combine_flowing_sections,
     lines_to_sections_hv_combined,
+    peel_left_margin_vertical_from_sections,
+    split_left_margin_vertical_from_sections,
     split_prose_sections_by_lanes,
 )
 from ocr_word_to_line_boxes import Line
@@ -103,6 +105,50 @@ class HorizontalGapSplitTests(unittest.TestCase):
         self.assertEqual(len(peeled_body), 1)
         self.assertEqual(len(peeled_margin), 1)
         self.assertEqual(peeled_margin[0].text, "arXiv")
+
+    def test_peel_left_margin_vertical_angle_only(self) -> None:
+        """OCR-vertical left-margin stamp splits from body; horizontal left labels stay."""
+        stamp = Word(
+            text="arXiv",
+            box=Box(51, 1545, 100, 1677),
+            index=0,
+            angle_deg=-90.0,
+        )
+        abstract = Word(
+            text="This",
+            box=Box(370, 820, 430, 848),
+            index=1,
+            angle_deg=0.0,
+        )
+        buyer = Word(
+            text="Buyer",
+            box=Box(67, 329, 120, 352),
+            index=2,
+            angle_deg=0.0,
+        )
+        mixed = Line(
+            index=0,
+            text="arXiv This",
+            box=stamp.box.union(abstract.box),
+            words=[stamp, abstract],
+        )
+        stamp_only = Line(index=1, text="arXiv", box=stamp.box, words=[stamp])
+        left_label = Line(index=2, text="Buyer", box=buyer.box, words=[buyer])
+        secs = [
+            _make_section(0, [mixed], None, 6.0),
+            _make_section(1, [stamp_only], None, 6.0),
+            _make_section(2, [left_label], None, 6.0),
+        ]
+        out = split_left_margin_vertical_from_sections(secs, 1800.0)
+        texts = [s.text for s in out]
+        self.assertTrue(any("This" in t for t in texts))
+        self.assertTrue(any("arXiv" in t for t in texts))
+        self.assertTrue(any("Buyer" in t for t in texts))
+        body = next(s for s in out if "This" in s.text)
+        spine = next(s for s in out if "arXiv" in s.text)
+        self.assertGreaterEqual(body.box.min_x, 360.0)
+        self.assertNotIn("This", spine.text)
+        self.assertLessEqual(spine.box.max_x, 1800.0 * 0.12)
 
     def test_margin_vertical_splits_from_horizontal_body_by_column_gap(self) -> None:
         """Wide horizontal gutter between margin stamp and prose must not merge sections."""

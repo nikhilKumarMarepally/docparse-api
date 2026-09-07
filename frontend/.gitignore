@@ -1,0 +1,5 @@
+
+.env.production.local
+.vercel
+dist
+node_modules

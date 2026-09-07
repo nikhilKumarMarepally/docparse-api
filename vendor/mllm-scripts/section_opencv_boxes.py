@@ -8,7 +8,12 @@ from typing import Any
 import cv2
 import numpy as np
 
-from form_box_detection import FormBox, detect_high_confidence_sections, _iou
+from form_box_detection import (
+    FormBox,
+    detect_high_confidence_sections,
+    detect_residual_figure_boxes,
+    _iou,
+)
 from ocr_line_to_sections import _make_section, lines_to_sections_hv_combined, Section
 from ocr_word_to_line_boxes import Box, Line, Word
 from section_table_layout import analyze_vertical_partition
@@ -213,6 +218,176 @@ def redact_ocr_words(
         y1 = min(h_img, int(word.box.max_y) + pad)
         cv2.rectangle(redacted, (x0, y0), (x1, y1), (255, 255, 255), -1)
     return redacted
+
+
+def residual_box_is_image(
+    image_bgr: np.ndarray,
+    box: FormBox,
+    words: list[Word],
+    *,
+    ocr_mask_pad: int = 4,
+) -> bool:
+    """True when leftover 2D ink/color is not explained by OCR (a figure)."""
+    h_img, w_img = image_bgr.shape[:2]
+    x0 = max(0, int(box.x))
+    y0 = max(0, int(box.y))
+    x1 = min(w_img, int(box.x2))
+    y1 = min(h_img, int(box.y2))
+    if x1 <= x0 or y1 <= y0:
+        return False
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    ocr_mask = np.zeros((h_img, w_img), np.uint8)
+    for word in words:
+        xa = max(0, int(word.box.min_x) - ocr_mask_pad)
+        ya = max(0, int(word.box.min_y) - ocr_mask_pad)
+        xb = min(w_img, int(word.box.max_x) + ocr_mask_pad)
+        yb = min(h_img, int(word.box.max_y) + ocr_mask_pad)
+        if xb > xa and yb > ya:
+            cv2.rectangle(ocr_mask, (xa, ya), (xb, yb), 255, -1)
+
+    ink = (gray < 200).astype(np.uint8) * 255
+    non_ocr = cv2.bitwise_and(ink, cv2.bitwise_not(ocr_mask))
+    h_len = max(40, w_img // 12)
+    v_len = max(40, h_img // 12)
+    # Shorter than page rules: field underlines / form strokes, not 2D figure ink.
+    h_ul = max(24, w_img // 40)
+    h_lines = cv2.morphologyEx(
+        non_ocr, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (h_len, 1))
+    )
+    v_lines = cv2.morphologyEx(
+        non_ocr, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_len))
+    )
+    underlines = cv2.morphologyEx(
+        non_ocr, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (h_ul, 3))
+    )
+    strokes = cv2.bitwise_or(cv2.bitwise_or(h_lines, v_lines), underlines)
+    figure = cv2.bitwise_and(non_ocr, cv2.bitwise_not(strokes))
+    crop = image_bgr[y0:y1, x0:x1]
+    ocr_frac = float(np.mean(ocr_mask[y0:y1, x0:x1] > 0))
+    fig_frac = float(np.mean(figure[y0:y1, x0:x1] > 0))
+    chroma = float(
+        np.mean(np.max(crop.astype(np.float32), axis=2) - np.min(crop.astype(np.float32), axis=2))
+    )
+    words_in = sum(
+        1
+        for w in words
+        if box.x <= w.box.centroid_x <= box.x2 and box.y <= w.box.centroid_y <= box.y2
+    )
+    if fig_frac >= 0.02:
+        return True
+    if chroma >= 3.5 and ocr_frac < 0.12:
+        # Color alone is not a figure when OCR words + rule strokes explain the box.
+        if words_in >= 4 and fig_frac < 0.008:
+            return False
+        return True
+    return False
+
+
+def detect_image_boxes_on_page(
+    image_bgr: np.ndarray,
+    words: list[Word],
+    *,
+    pad: int = 4,
+) -> list[FormBox]:
+    """OpenCV figure boxes only — residual text panels are dropped."""
+    redacted = redact_ocr_words(image_bgr, words, pad=pad)
+    candidates = detect_residual_figure_boxes(redacted)
+    return [box for box in candidates if residual_box_is_image(image_bgr, box, words)]
+
+
+def _line_centroid_in_box(line: Line, box: FormBox) -> bool:
+    cx = line.content_box.centroid_x
+    cy = line.content_box.centroid_y
+    return box.x <= cx <= box.x2 and box.y <= cy <= box.y2
+
+
+def merge_image_boxes_into_sections(
+    sections: list[Section],
+    image_boxes: list[FormBox],
+    *,
+    page_width: float,
+    page_height: float,
+    pad: float = SECTION_PAD,
+) -> tuple[list[Section], dict[str, Any]]:
+    """Keep production OCR sections; replace overlapping lines with figure bounds.
+
+    Image boxes with no OCR lines still become a section (empty lines, snapped box).
+    """
+    if not image_boxes:
+        out = _reindex_sections(list(sections))
+        return out, {
+            "mode": "opencv_image_boxes",
+            "image_box_count": 0,
+            "figure_section_indices": [],
+            "section_count": len(out),
+        }
+
+    all_lines: list[Line] = []
+    seen: set[int] = set()
+    for sec in sections:
+        for ln in sec.lines:
+            lid = id(ln)
+            if lid not in seen:
+                seen.add(lid)
+                all_lines.append(ln)
+
+    assigned: set[int] = set()
+    figure_secs: list[Section] = []
+    for box in sorted(image_boxes, key=lambda b: (b.y, b.x)):
+        inside = [ln for ln in all_lines if _line_centroid_in_box(ln, box)]
+        assigned.update(id(ln) for ln in inside)
+        if inside:
+            inside = sorted(inside, key=lambda ln: ln.content_box.min_y)
+            sec = _make_section(len(figure_secs), inside, None, pad)
+        else:
+            sec = Section(
+                index=len(figure_secs),
+                lines=[],
+                text="",
+                box=Box(0.0, 0.0, 1.0, 1.0),
+                gap_above=None,
+            )
+        figure_secs.append(
+            _section_with_opencv_bounds(
+                sec,
+                box,
+                pad=pad,
+                page_width=page_width,
+                page_height=page_height,
+            )
+        )
+
+    text_secs: list[Section] = []
+    for sec in sections:
+        leftover = [ln for ln in sec.lines if id(ln) not in assigned]
+        if not leftover:
+            continue
+        leftover = sorted(leftover, key=lambda ln: ln.content_box.min_y)
+        text_secs.append(_make_section(len(text_secs), leftover, sec.gap_above, pad))
+
+    merged = figure_secs + text_secs
+    merged.sort(key=lambda s: (s.box.min_y, s.box.min_x))
+    out = _reindex_sections(merged)
+    figure_indices: list[int] = []
+    for i, sec in enumerate(out):
+        for fig in figure_secs:
+            if (
+                abs(sec.box.min_x - fig.box.min_x) < 1.0
+                and abs(sec.box.min_y - fig.box.min_y) < 1.0
+                and abs(sec.box.max_x - fig.box.max_x) < 1.0
+                and abs(sec.box.max_y - fig.box.max_y) < 1.0
+            ):
+                figure_indices.append(i)
+                break
+    meta: dict[str, Any] = {
+        "mode": "opencv_image_boxes",
+        "image_box_count": len(image_boxes),
+        "figure_section_count": len(figure_secs),
+        "figure_section_indices": figure_indices,
+        "section_count": len(out),
+    }
+    return out, meta
 
 
 def _line_box_intersection_area(line: Line, box: FormBox) -> float:

@@ -735,6 +735,119 @@ def _strip_margin_words_from_lines(
     return out
 
 
+def _is_left_margin_vertical_word(word: Word, page_width: float, margin_frac: float = 0.12) -> bool:
+    """OCR-rotated glyph parked in the left margin (arXiv spine). Angle only — no aspect."""
+    if page_width <= 0 or not word_is_vertical(word):
+        return False
+    return word.box.max_x <= page_width * margin_frac
+
+
+def _is_left_margin_stamp_word(word: Word, page_width: float) -> bool:
+    """Tall narrow left-edge stamp when OCR omits rotation angle (RISC watermark strip)."""
+    if page_width <= 0:
+        return False
+    text = (word.text or "").strip()
+    if not text or text in {"-", "–", "—"}:
+        return False
+    cb = word.box
+    narrow_margin = page_width * 0.055
+    if cb.max_x > narrow_margin or cb.width > 16.0:
+        return False
+    aspect = cb.height / max(1.0, cb.width)
+    return aspect >= 2.5 and cb.height >= 30.0
+
+
+def partition_left_margin_vertical_words(
+    lines: list[Line],
+    page_width: float,
+    *,
+    margin_frac: float = 0.12,
+) -> tuple[list[Line], list[Line]]:
+    """Split OCR-vertical left-margin words from horizontal body words."""
+    if page_width <= 0:
+        return lines, []
+    body: list[Line] = []
+    margin: list[Line] = []
+    idx_b = 0
+    idx_m = 0
+    for ln in lines:
+        vert = [
+            w
+            for w in ln.words
+            if _is_left_margin_vertical_word(w, page_width, margin_frac)
+            or _is_left_margin_stamp_word(w, page_width)
+        ]
+        horiz = [
+            w
+            for w in ln.words
+            if not (
+                _is_left_margin_vertical_word(w, page_width, margin_frac)
+                or _is_left_margin_stamp_word(w, page_width)
+            )
+        ]
+        if vert:
+            chunk = line_from_words(vert, index=idx_m)
+            if chunk is not None:
+                margin.append(chunk)
+                idx_m += 1
+        if not horiz:
+            continue
+        if len(horiz) == len(ln.words):
+            body.append(ln)
+            continue
+        chunk = line_from_words(horiz, index=idx_b)
+        if chunk is not None:
+            body.append(chunk)
+            idx_b += 1
+    return body, margin
+
+
+def strip_left_margin_vertical_words(
+    lines: list[Line],
+    page_width: float,
+    *,
+    margin_frac: float = 0.12,
+) -> list[Line]:
+    """Remove left-margin vertical-angle words from lines; keep horizontal left-column text."""
+    body, _margin = partition_left_margin_vertical_words(
+        lines, page_width, margin_frac=margin_frac
+    )
+    return body
+
+
+def split_left_margin_vertical_from_sections(
+    sections: list[Section],
+    page_width: float,
+    *,
+    pad: float = 6.0,
+    margin_frac: float = 0.12,
+) -> list[Section]:
+    """Unmix a vertical left-margin stamp from body sections; keep it as its own section."""
+    body_secs: list[Section] = []
+    margin_lines: list[Line] = []
+    for sec in sections:
+        body_lines, vert_lines = partition_left_margin_vertical_words(
+            sec.lines, page_width, margin_frac=margin_frac
+        )
+        margin_lines.extend(vert_lines)
+        if body_lines:
+            body_secs.append(_make_section(len(body_secs), body_lines, sec.gap_above, pad))
+    return _attach_margin_vertical_sections(body_secs, margin_lines, pad=pad)
+
+
+def peel_left_margin_vertical_from_sections(
+    sections: list[Section],
+    page_width: float,
+    *,
+    pad: float = 6.0,
+    margin_frac: float = 0.12,
+) -> list[Section]:
+    """Alias: split vertical left-margin words into their own sections (do not drop)."""
+    return split_left_margin_vertical_from_sections(
+        sections, page_width, pad=pad, margin_frac=margin_frac
+    )
+
+
 def _cluster_margin_vertical_sections(
     margin_lines: list[Line],
     *,
@@ -1927,6 +2040,8 @@ def draw_sections_overlay(
             label = f"S{idx} T"
         elif kind == "section_table":
             label = f"S{idx} S+T"
+        elif kind == "figure":
+            label = f"S{idx} IMG"
         else:
             label = f"S{idx}"
         label_w = max(34, int(fill_draw.textlength(label, font=font)) + 8)

@@ -6,6 +6,7 @@ Object-oriented section pipeline steps.
 | 1 | B2ad4c9SectioningStep | b2ad4c9 process_page sectioning + horizontal-gap vendor code |
 | 2 | VerticalTableMergeStep | Glue adjacent table row/header/footer shards vertically |
 | 3 | HorizontalXGapSplitStep | Split non-table sections at L/R gutter when gap >> row word spacing |
+| 4 | OpenCVImageBoxStep | Merge residual-ink OpenCV **image** boxes only (drop text panels) |
 """
 
 from __future__ import annotations
@@ -19,12 +20,17 @@ from app.section_pipeline_context import (
     merge_raw_table_sections,
     PageSectionContext,
     reindex_sections_globally,
+    sections_from_merged_dicts,
     sections_objs_to_dicts,
 )
 
 ensure_script_path()
 
-from section_opencv_boxes import split_sections_by_horizontal_x_gaps  # noqa: E402
+from section_opencv_boxes import (  # noqa: E402
+    detect_image_boxes_on_page,
+    merge_image_boxes_into_sections,
+    split_sections_by_horizontal_x_gaps,
+)
 
 
 class SectionPipelineStep(ABC):
@@ -109,6 +115,62 @@ class HorizontalXGapSplitStep(SectionPipelineStep):
         )
         ctx.sections = sections
         ctx.section_meta[self.snapshot_key] = split_meta
+        ctx.snapshot(self.snapshot_key)
+
+
+class OpenCVImageBoxStep(SectionPipelineStep):
+    """Step 4 — residual-ink OpenCV figures only; ignore text boxes from that detector."""
+
+    name = "opencv_image_boxes"
+    snapshot_key = "step4_opencv_image_boxes"
+
+    def run(self, ctx: PageSectionContext) -> None:
+        import cv2
+        import numpy as np
+
+        rgb = np.asarray(ctx.page_rgb.convert("RGB"))
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        image_boxes = detect_image_boxes_on_page(bgr, ctx.words)
+        ctx.sections, meta = merge_image_boxes_into_sections(
+            ctx.sections,
+            image_boxes,
+            page_width=float(ctx.page_width),
+            page_height=float(ctx.page_rgb.height),
+        )
+        fig_idx = list(meta.get("figure_section_indices") or [])
+        orig_fig_boxes = [
+            ctx.sections[i].box for i in fig_idx if 0 <= i < len(ctx.sections)
+        ]
+        raw_sections = sections_objs_to_dicts(ctx.sections)
+        line_pool: dict[int, object] = {}
+        for sec in ctx.sections:
+            for ln in sec.lines:
+                line_pool[int(ln.index)] = ln
+        merged_sections, extra_merges = merge_raw_table_sections(
+            raw_sections,
+            line_pool or ctx.line_pool,
+            page_width=float(ctx.page_width),
+        )
+        if extra_merges:
+            ctx.merge_count += extra_merges
+            ctx.sections = sections_from_merged_dicts(merged_sections, line_pool)
+            new_fig: list[int] = []
+            for i, sec in enumerate(ctx.sections):
+                for fb in orig_fig_boxes:
+                    if (
+                        abs(sec.box.min_x - fb.min_x) < 1.0
+                        and abs(sec.box.min_y - fb.min_y) < 1.0
+                        and abs(sec.box.max_x - fb.max_x) < 1.0
+                        and abs(sec.box.max_y - fb.max_y) < 1.0
+                    ):
+                        new_fig.append(i)
+                        break
+            meta["figure_section_indices"] = new_fig
+            meta["table_fragments_merged"] = extra_merges
+            meta["section_count"] = len(ctx.sections)
+        for idx in meta.get("figure_section_indices") or []:
+            ctx.section_meta[f"S{idx}"] = {"layout_kind": "figure"}
+        ctx.section_meta[self.snapshot_key] = meta
         ctx.snapshot(self.snapshot_key)
 
 

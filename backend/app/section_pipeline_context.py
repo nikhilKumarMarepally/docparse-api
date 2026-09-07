@@ -20,7 +20,7 @@ from ocr_line_to_sections import (  # noqa: E402
     gap_stats,
     Section,
 )
-from ocr_word_to_line_boxes import Line  # noqa: E402
+from ocr_word_to_line_boxes import Box, Line  # noqa: E402
 from app.section_merge import merge_table_fragments  # noqa: E402
 
 MIN_GAP_PX = 18.0
@@ -95,6 +95,40 @@ def merge_raw_table_sections(
         page_width=page_width,
     )
     return merged, before - len(merged)
+
+
+def sections_from_merged_dicts(
+    raw_sections: list[dict[str, Any]],
+    lines: list[Any] | dict[int, Any],
+) -> list[Section]:
+    """Rebuild sections after table merge, keeping OpenCV/figure bounds and empty boxes."""
+    by_index = lines if isinstance(lines, dict) else {ln.index: ln for ln in lines}
+    out: list[Section] = []
+    for i, sec in enumerate(raw_sections):
+        sec_lines: list[Any] = []
+        seen: set[int] = set()
+        for line_idx in sec.get("line_indices") or []:
+            idx = int(line_idx)
+            if idx in by_index and idx not in seen:
+                sec_lines.append(by_index[idx])
+                seen.add(idx)
+        bounds = sec.get("bounds") or {}
+        box = Box(
+            float(bounds.get("min_x", 0)),
+            float(bounds.get("min_y", 0)),
+            float(bounds.get("max_x", 0)),
+            float(bounds.get("max_y", 0)),
+        )
+        out.append(
+            Section(
+                index=i,
+                lines=sec_lines,
+                text=str(sec.get("text") or ""),
+                box=box,
+                gap_above=sec.get("gap_above"),
+            )
+        )
+    return out
 
 
 @dataclass
